@@ -1,4 +1,4 @@
-#include "q4s_client.h"
+#include "q4s_client_negotiation.h"
 
 // GENERAL VARIABLES
 
@@ -79,6 +79,7 @@ int num_jitter_measures_server;
 int num_packetloss_measures_server;
 // Variable that shows number of Q4S BWIDTHs received in a period
 int num_bwidth_received;
+
 
 
 // GENERAL FUNCTIONS
@@ -436,50 +437,6 @@ void create_ready1 (type_q4s_message *q4s_message) {
   // Delegates in a request creation function
   create_request (q4s_message,"READY", header, body);
 }
-
-// Creation of Q4S READY 2 message
-void create_ready2 (type_q4s_message *q4s_message) {
-  char body[5000]; // it will be empty or filled with SDP parameters
-	memset(body, '\0', sizeof(body)); // body is empty by default
-
-	char header[500]; // it will be filled with header fields
-  memset(header, '\0', sizeof(header));
-
-	char h1[100];
-	memset(h1, '\0', sizeof(h1));
-
-	char h2[100];
-	memset(h2, '\0', sizeof(h2));
-
-	char h3[100];
-	memset(h3, '\0', sizeof(h3));
-
-	char h4[100];
-	memset(h4, '\0', sizeof(h4));
-
-	// Prepares some header fields
-	strcpy(h1, "Stage: 2\n");
-	strcpy(h2, "Content-Type: application/sdp\n");
-	strcpy(h3, "User-Agent: q4s-ua-experimental-1.0\n");
-
-  // Includes body length in "Content Length" header field
-	strcpy(h4, "Content Length: ");
-	int body_length = strlen(body);
-	char s_body_length[10];
-	sprintf(s_body_length, "%d", body_length);
-  strcat(h4, s_body_length);
-	strcat(h4, "\n");
-
-  // Prepares header with header fields
-	strcpy(header, h1);
-	strcat(header, h2);
-	strcat(header, h3);
-	strcat(header, h4);
-
-  // Delegates in a request creation function
-  create_request (q4s_message,"READY", header, body);
-}
-
 
 // Creation of Q4S PING message
 void create_ping (type_q4s_message *q4s_message) {
@@ -2011,32 +1968,12 @@ int check_go_to_1 (fsm_t* this) {
 	return result;
 }
 
-// Checks if client wants to go to Stage 2
-int check_go_to_2 (fsm_t* this) {
-	int result;
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-	result = (flags & FLAG_GO_TO_2);
-  pthread_mutex_unlock(&mutex_flags);
-	return result;
-}
-
-// Checks if ping timeout has occurred in Stage 0
+// Checks if ping timeout has occurred
 int check_temp_ping_0 (fsm_t* this) {
 	int result;
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
 	result = (flags & FLAG_TEMP_PING_0);
-  pthread_mutex_unlock(&mutex_flags);
-	return result;
-}
-
-// Checks if ping timeout has occurred in Stage 2
-int check_temp_ping_2 (fsm_t* this) {
-	int result;
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-	result = (flags & FLAG_TEMP_PING_2);
   pthread_mutex_unlock(&mutex_flags);
 	return result;
 }
@@ -2260,24 +2197,6 @@ void Ready1 (fsm_t* fsm) {
 	pthread_mutex_lock(&mutex_session);
   // Fills q4s_session.message_to_send with the Q4S READY 1 parameters
 	create_ready1(&q4s_session.message_to_send);
-	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
-	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
-	// Sends the prepared message
-	send_message_TCP(q4s_session.prepared_message);
-	pthread_mutex_unlock(&mutex_session);
-}
-
-// Creates and sends a Q4S READY 2 message to the server
-void Ready2 (fsm_t* fsm) {
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-  flags &= ~FLAG_GO_TO_2;
-  pthread_mutex_unlock(&mutex_flags);
-
-
-	pthread_mutex_lock(&mutex_session);
-  // Fills q4s_session.message_to_send with the Q4S READY 1 parameters
-	create_ready2(&q4s_session.message_to_send);
 	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
 	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
 	// Sends the prepared message
@@ -2846,31 +2765,25 @@ int main () {
 	// State machine: list of transitions
 	// {OriginState, CheckFunction, DestinationState, ActionFunction}
 	fsm_trans_t q4s_table[] = {
-		  { WAIT_CONNECT, check_connect, WAIT_START, Setup },
-			{ WAIT_START, check_begin,  HANDSHAKE, Begin },
-			{ HANDSHAKE, check_receive_ok,  HANDSHAKE, Store },
-			{ HANDSHAKE, check_go_to_0,  STAGE_0, Ready0 },
-			{ HANDSHAKE, check_go_to_1,  STAGE_1, Ready1 },
-			{ HANDSHAKE, check_cancel, TERMINATION, Cancel },
-			{ STAGE_0, check_receive_ok, PING_MEASURE_0, Ping_Init },
-			{ PING_MEASURE_0, check_temp_ping_0, PING_MEASURE_0, Ping },
-			{ PING_MEASURE_0, check_receive_ok, PING_MEASURE_0, Update },
-			{ PING_MEASURE_0, check_receive_ping, PING_MEASURE_0, Update },
-			{ PING_MEASURE_0, check_finish_ping, WAIT_NEXT, Decide },
-			{ WAIT_NEXT, check_go_to_1, STAGE_1, Ready1 },
-			{ STAGE_1, check_receive_ok, BWIDTH_MEASURE, Bwidth_Init },
-			{ BWIDTH_MEASURE, check_temp_bwidth, BWIDTH_MEASURE, Bwidth },
-			{ BWIDTH_MEASURE, check_receive_bwidth, BWIDTH_MEASURE, Update },
-			{ BWIDTH_MEASURE, check_finish_bwidth, WAIT_NEXT, Decide },
-			{ WAIT_NEXT, check_cancel, TERMINATION, Cancel},
-			{ WAIT_NEXT, check_go_to_2, STAGE_2, Ready2 },
-			{ STAGE_2, check_receive_ok, PING_MEASURE_2,  Ping_Init },
-			{ PING_MEASURE_2, check_temp_ping_2, PING_MEASURE_2, Ping },
-			{ PING_MEASURE_2, check_receive_ok, PING_MEASURE_2, Update },
-			{ PING_MEASURE_2, check_receive_ping, PING_MEASURE_2, Update },
-			{ PING_MEASURE_2, check_cancel, TERMINATION, Cancel},
-			{ TERMINATION, check_receive_cancel, WAIT_CONNECT,  Exit },
-			{ -1, NULL, -1, NULL }
+		{ WAIT_CONNECT, check_connect, WAIT_START, Setup },
+		{ WAIT_START, check_begin,  HANDSHAKE, Begin },
+		{ HANDSHAKE, check_receive_ok,  HANDSHAKE, Store },
+		{ HANDSHAKE, check_go_to_0,  STAGE_0, Ready0 },
+		{ HANDSHAKE, check_go_to_1,  STAGE_1, Ready1 },
+		{ HANDSHAKE, check_cancel, TERMINATION, Cancel },
+		{ STAGE_0, check_receive_ok, PING_MEASURE_0, Ping_Init },
+		{ PING_MEASURE_0, check_temp_ping_0, PING_MEASURE_0, Ping },
+		{ PING_MEASURE_0, check_receive_ok, PING_MEASURE_0, Update },
+		{ PING_MEASURE_0, check_receive_ping, PING_MEASURE_0, Update },
+		{ PING_MEASURE_0, check_finish_ping, WAIT_NEXT, Decide },
+		{ WAIT_NEXT, check_go_to_1, STAGE_1, Ready1 },
+		{ STAGE_1, check_receive_ok, BWIDTH_MEASURE, Bwidth_Init },
+		{ BWIDTH_MEASURE, check_temp_bwidth, BWIDTH_MEASURE, Bwidth },
+		{ BWIDTH_MEASURE, check_receive_bwidth, BWIDTH_MEASURE, Update },
+		{ BWIDTH_MEASURE, check_finish_bwidth, WAIT_NEXT, Decide },
+		{ WAIT_NEXT, check_cancel, TERMINATION, Cancel},
+		{ TERMINATION, check_receive_cancel, WAIT_CONNECT,  Exit },
+		{ -1, NULL, -1, NULL }
 	};
 
   // State machine creation

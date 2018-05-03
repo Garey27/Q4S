@@ -1,4 +1,4 @@
-#include "q4s_server.h"
+#include "q4s_server_negotiation.h"
 
 // GENERAL VARIABLES
 
@@ -2795,20 +2795,6 @@ int check_receive_ready1 (fsm_t* this) {
   return result;
 }
 
-// Checks if client wants to start stage 2 (Q4S READY 2 is received)
-int check_receive_ready2 (fsm_t* this) {
-	int result;
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-	result = (flags & FLAG_RECEIVE_READY2);
-  pthread_mutex_unlock(&mutex_flags);
-	if (result > 0) {
-		pthread_cancel(receive_UDP_thread);
-	}
-  return result;
-}
-
-
 // Checks if q4s server has received a Q4S PING from client
 int check_receive_ping (fsm_t* this) {
 	int result;
@@ -2829,7 +2815,7 @@ int check_receive_ok (fsm_t* this) {
 	return result;
 }
 
-// Checks if ping timeout has occurred in Stage 0
+// Checks if ping timeout has occurred
 int check_temp_ping_0 (fsm_t* this) {
 	int result;
 	// Lock to guarantee mutual exclusion
@@ -2839,33 +2825,12 @@ int check_temp_ping_0 (fsm_t* this) {
 	return result;
 }
 
-// Checks if ping timeout has occurred in Stage 2
-int check_temp_ping_2 (fsm_t* this) {
-	int result;
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-	result = (flags & FLAG_TEMP_PING_2);
-  pthread_mutex_unlock(&mutex_flags);
-	return result;
-}
-
-
 // Checks if an alert has to be triggered
 int check_alert (fsm_t* this) {
 	int result;
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
 	result = (flags & FLAG_ALERT);
-  pthread_mutex_unlock(&mutex_flags);
-	return result;
-}
-
-// Checks if a recovery message has to be triggered
-int check_recover (fsm_t* this) {
-	int result;
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-	result = (flags & FLAG_RECOVER);
   pthread_mutex_unlock(&mutex_flags);
 	return result;
 }
@@ -3467,23 +3432,8 @@ void Alert (fsm_t* fsm) {
 	printf("\nAn alert notification has been sent to the Actuator\n");
 	pthread_mutex_unlock(&mutex_print);
 
-	// Starts timer for recovery pause
+	// Starts timer for ping delivery
 	pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
-
-}
-
-// Triggers a recovery message to the Actuator
-void Recover (fsm_t* fsm) {
-	// Lock to guarantee mutual exclusion
-	pthread_mutex_lock(&mutex_flags);
-  flags &= ~FLAG_RECOVER;
-  pthread_mutex_unlock(&mutex_flags);
-
-	pthread_mutex_lock(&mutex_print);
-	printf("\nA recovery notification has been sent to the Actuator\n");
-	pthread_mutex_unlock(&mutex_print);
-
-	// Starts timer for recovery pause
 
 }
 
@@ -3603,7 +3553,6 @@ void *thread_explores_keyboard () {
 	}
 }
 
-
 // EXECUTION OF MAIN PROGRAM
 int main () {
 	// System configuration
@@ -3616,35 +3565,28 @@ int main () {
 	// State machine: list of transitions
 	// {OriginState, CheckFunction, DestinationState, ActionFunction}
 	fsm_trans_t q4s_table[] = {
-		  { WAIT_CONNECTION, check_new_connection, WAIT_START, Setup},
-			{ WAIT_START, check_receive_begin,  HANDSHAKE, Respond_ok },
-			{ HANDSHAKE, check_receive_ready0,  STAGE_0, Respond_ok },
-			{ HANDSHAKE, check_receive_ready1,  STAGE_1, Respond_ok },
-			{ HANDSHAKE, check_receive_cancel, TERMINATION, Release },
-			{ STAGE_0, check_receive_ping, PING_MEASURE_0, Respond_ok },
-			{ PING_MEASURE_0, check_temp_ping_0, PING_MEASURE_0, Ping },
-			{ PING_MEASURE_0, check_receive_ok, PING_MEASURE_0, Update },
-			{ PING_MEASURE_0, check_receive_ping, PING_MEASURE_0, Update },
-			{ PING_MEASURE_0, check_alert, PING_MEASURE_0, Alert },
-			{ PING_MEASURE_0, check_receive_ready1, STAGE_1, Respond_ok },
-			{ PING_MEASURE_0, check_receive_cancel, TERMINATION, Release },
-			{ STAGE_1, check_init_bwidth, BWIDTH_MEASURE, Bwidth_Init },
-			{ BWIDTH_MEASURE, check_temp_bwidth, BWIDTH_MEASURE, Bwidth },
-			{ BWIDTH_MEASURE, check_receive_bwidth, BWIDTH_MEASURE, Update },
-			{ BWIDTH_MEASURE, check_alert, BWIDTH_MEASURE, Alert },
-			{ BWIDTH_MEASURE, check_receive_ready2, STAGE_2, Respond_ok },
-			{ STAGE_2, check_receive_ping, PING_MEASURE_2, Respond_ok },
-			{ PING_MEASURE_2, check_temp_ping_2, PING_MEASURE_2, Ping },
-			{ PING_MEASURE_2, check_receive_ok, PING_MEASURE_2, Update },
-			{ PING_MEASURE_2, check_receive_ping, PING_MEASURE_2, Update },
-      { PING_MEASURE_2, check_alert, PING_MEASURE_2, Alert },
-      { PING_MEASURE_2, check_recover, PING_MEASURE_2, Recover },
-			{ PING_MEASURE_2, check_receive_cancel, TERMINATION, Release },
-			{ TERMINATION, check_released, WAIT_CONNECTION,  Cancel },
-			{ -1, NULL, -1, NULL }
+		{ WAIT_CONNECTION, check_new_connection, WAIT_START, Setup},
+		{ WAIT_START, check_receive_begin,  HANDSHAKE, Respond_ok },
+		{ HANDSHAKE, check_receive_ready0,  STAGE_0, Respond_ok },
+		{ HANDSHAKE, check_receive_ready1,  STAGE_1, Respond_ok },
+		{ HANDSHAKE, check_receive_cancel, TERMINATION, Release },
+		{ STAGE_0, check_receive_ping, PING_MEASURE_0, Respond_ok },
+		{ PING_MEASURE_0, check_temp_ping_0, PING_MEASURE_0, Ping },
+		{ PING_MEASURE_0, check_receive_ok, PING_MEASURE_0, Update },
+		{ PING_MEASURE_0, check_receive_ping, PING_MEASURE_0, Update },
+		{ PING_MEASURE_0, check_alert, PING_MEASURE_0, Alert },
+		{ PING_MEASURE_0, check_receive_ready1, STAGE_1, Respond_ok },
+		{ PING_MEASURE_0, check_receive_cancel, TERMINATION, Release },
+		{ STAGE_1, check_init_bwidth, BWIDTH_MEASURE, Bwidth_Init },
+		{ BWIDTH_MEASURE, check_temp_bwidth, BWIDTH_MEASURE, Bwidth },
+		{ BWIDTH_MEASURE, check_receive_bwidth, BWIDTH_MEASURE, Update },
+		{ BWIDTH_MEASURE, check_alert, BWIDTH_MEASURE, Alert },
+		{ BWIDTH_MEASURE, check_receive_cancel, TERMINATION, Release },
+		{ TERMINATION, check_released, WAIT_CONNECTION,  Cancel },
+		{ -1, NULL, -1, NULL }
 	};
 
-	// State machine creation
+  // State machine creation
 	fsm_t* q4s_fsm = fsm_new (WAIT_CONNECTION, q4s_table, NULL);
 
 	// State machine initialitation

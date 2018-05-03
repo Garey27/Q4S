@@ -1,5 +1,5 @@
-#ifndef _Q4SCLIENT_H_
-#define _Q4SCLIENT_H_
+#ifndef _Q4SCLIENTNEGOTIATION_H_
+#define _Q4SCLIENTNEGOTIATION_H_
 
 #include <time.h> // to use clock
 #include <sys/time.h> // to use gettimeofday
@@ -40,10 +40,8 @@
 #define FLAG_TEMP_BWIDTH    			0x100
 #define FLAG_RECEIVE_BWIDTH   		0x200
 #define FLAG_FINISH_BWIDTH    	  0x400
-#define FLAG_GO_TO_2   			      0x800
-#define FLAG_TEMP_PING_2      		0x1000
-#define FLAG_CANCEL               0x2000
-#define FLAG_RECEIVE_CANCEL       0x4000
+#define FLAG_CANCEL               0x800
+#define FLAG_RECEIVE_CANCEL       0x1000
 
 // Q4S open ports
 #define HOST_PORT_TCP 56001
@@ -79,8 +77,6 @@ typedef enum {
   WAIT_NEXT,
 	STAGE_1,
   BWIDTH_MEASURE,
-  STAGE_2,
-  PING_MEASURE_2,
   TERMINATION
 } type_state_machine;
 
@@ -135,8 +131,6 @@ int check_go_to_1 (fsm_t* this);
 int check_temp_bwidth (fsm_t* this);
 int check_receive_bwidth (fsm_t* this);
 int check_finish_bwidth (fsm_t* this);
-int check_go_to_2 (fsm_t* this);
-int check_temp_ping_2 (fsm_t* this);
 int check_cancel (fsm_t* this);
 int check_receive_cancel (fsm_t* this);
 
@@ -152,7 +146,6 @@ void Respond_ok (fsm_t* fsm);
 void Decide (fsm_t* fsm);
 void Ready1 (fsm_t* fsm);
 void Bwidth (fsm_t* fsm);
-void Ready2 (fsm_t* fsm);
 void Cancel (fsm_t* fsm);
 void Exit (fsm_t* fsm);
 
@@ -163,7 +156,6 @@ void create_200 (type_q4s_message *q4s_message);
 void create_bwidth (type_q4s_message *q4s_message);
 void create_ready0 (type_q4s_message *q4s_message);
 void create_ready1 (type_q4s_message *q4s_message);
-void create_ready2 (type_q4s_message *q4s_message);
 void create_cancel (type_q4s_message *q4s_message);
 void create_request (type_q4s_message *q4s_message, char method[10],
   char header[500], char body[5000]);
@@ -206,4 +198,4 @@ int ms_elapsed(struct timespec tm1, struct timespec tm2);
 void sort_array(int samples[MAXNUMSAMPLES], int length);
 int min (int a, int b);
 
-#endif /* _Q4SCLIENT_H_ */
+#endif /* _Q4SCLIENTNEGOTIATION_H_ */
