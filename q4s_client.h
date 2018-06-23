@@ -2,7 +2,6 @@
 #define _Q4SCLIENT_H_
 
 #include <time.h> // to use clock
-#include <sys/time.h> // to use gettimeofday
 #include <stdio.h> // to use printf
 #include <stdlib.h> // to use NULL
 #include <string.h>  // to use strcpy, strcat, etc
@@ -26,7 +25,11 @@
 #include "kbhit.h"
 #include "kbhit.c"
 
-#define CLK_MS 10 // state machine update period
+// To use md5 algorithm
+#include <openssl/md5.h>
+
+
+#define CLK_FSM 0 // state machine update period
 
 // FLAGS of the system
 #define FLAG_CONNECT              0x01
@@ -37,13 +40,14 @@
 #define FLAG_TEMP_PING_0        	0x20
 #define FLAG_RECEIVE_PING         0x40
 #define FLAG_FINISH_PING     			0x80
-#define FLAG_TEMP_BWIDTH    			0x100
-#define FLAG_RECEIVE_BWIDTH   		0x200
-#define FLAG_FINISH_BWIDTH    	  0x400
-#define FLAG_GO_TO_2   			      0x800
-#define FLAG_TEMP_PING_2      		0x1000
-#define FLAG_CANCEL               0x2000
-#define FLAG_RECEIVE_CANCEL       0x4000
+#define FLAG_BWIDTH_BURST_SENT    0x100
+#define FLAG_RECEIVE_BWIDTH    		0x200
+#define FLAG_MEASURE_BWIDTH   		0x400
+#define FLAG_FINISH_BWIDTH    	  0x800
+#define FLAG_GO_TO_2   			      0x1000
+#define FLAG_TEMP_PING_2      		0x2000
+#define FLAG_CANCEL               0x4000
+#define FLAG_RECEIVE_CANCEL       0x8000
 
 // Q4S open ports
 #define HOST_PORT_TCP 56001
@@ -53,8 +57,7 @@
 
 #define MAXDATASIZE 6000 // maximum size of a Q4S message in bytes
 #define MESSAGE_BWIDTH_SIZE 1000 // size of Q4S BWIDTH messages in bytes
-#define NUMSAMPLESTOSUCCEED 10 // number of successful samples needed to go to next stage
-#define MAXNUMSAMPLES 6000 // size of arrays of samples
+#define MAXNUMSAMPLES 300 // size of arrays of samples
 
 // Type defined for Q4S messages
 typedef struct {
@@ -81,14 +84,17 @@ typedef enum {
   BWIDTH_MEASURE,
   STAGE_2,
   PING_MEASURE_2,
-  TERMINATION
+  TERMINATION,
+  END
 } type_state_machine;
 
 // Type defined for a q4s client session
 typedef struct {
 	int session_id;
   int expiration_time;
-  int ping_clk_negotiation; // in ms
+  int stage;
+  int ping_clk_negotiation_client; // in ms
+  int ping_clk_negotiation_server; // in ms
   int ping_clk_continuity; // in ms
   int bwidth_clk; // in ms
   int bwidth_messages_per_ms; // BWIDTH messages sent each 1 ms
@@ -100,6 +106,7 @@ typedef struct {
   int seq_num_confirmed;
   int qos_level[2]; // {upstream, downstream}
   int alert_pause;
+  bool alert_pause_activated;
   int latency_th;
   int jitter_th[2];  // {upstream, downstream}
   int bw_th[2];  // {upstream, downstream}
@@ -113,14 +120,15 @@ typedef struct {
   float packetloss_measure_server; // upstream
   float packetloss_measure_client; // downstream
   int latency_samples[MAXNUMSAMPLES];
+  int latency_window[MAXNUMSAMPLES];
   int elapsed_time_samples[MAXNUMSAMPLES];
+  int elapsed_time_window[MAXNUMSAMPLES];
   int packetloss_samples[MAXNUMSAMPLES];
-  int bw_samples[MAXNUMSAMPLES];
+  int packetloss_window[MAXNUMSAMPLES];
   char server_timestamp[40];
 	type_q4s_message message_to_send;
 	char prepared_message[MAXDATASIZE];
 	type_q4s_message message_received;
-	type_state_machine state;
 } type_q4s_session;
 
 // Prototype of check functions
@@ -132,8 +140,9 @@ int check_temp_ping_0 (fsm_t* this);
 int check_receive_ping (fsm_t* this);
 int check_finish_ping (fsm_t* this);
 int check_go_to_1 (fsm_t* this);
-int check_temp_bwidth (fsm_t* this);
+int check_bwidth_burst_sent (fsm_t* this);
 int check_receive_bwidth (fsm_t* this);
+int check_measure_bwidth (fsm_t* this);
 int check_finish_bwidth (fsm_t* this);
 int check_go_to_2 (fsm_t* this);
 int check_temp_ping_2 (fsm_t* this);
@@ -151,7 +160,7 @@ void Update (fsm_t* fsm);
 void Respond_ok (fsm_t* fsm);
 void Decide (fsm_t* fsm);
 void Ready1 (fsm_t* fsm);
-void Bwidth (fsm_t* fsm);
+void Bwidth_Decide (fsm_t* fsm);
 void Ready2 (fsm_t* fsm);
 void Cancel (fsm_t* fsm);
 void Exit (fsm_t* fsm);
@@ -170,7 +179,7 @@ void create_request (type_q4s_message *q4s_message, char method[10],
 void create_response (type_q4s_message *q4s_message, char status_code[10],
 	char reason_phrase[10], char header[500], char body[5000]);
 void prepare_message (type_q4s_message *q4s_message, char prepared_message[MAXDATASIZE]);
-void store_message (char received_message[MAXDATASIZE], type_q4s_message *q4s_message);
+bool store_message (char received_message[MAXDATASIZE], type_q4s_message *q4s_message);
 
 // Prototype of Q4S parameter storage function
 void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_message);
@@ -193,17 +202,25 @@ void *thread_receives_UDP();
 void *thread_explores_keyboard();
 
 // Prototype of timer functions
-void *ping_timeout();
-void *bwidth_timeout();
+void *ping_timeout_0();
+void *ping_timeout_2();
+void *bwidth_delivery();
+void *bwidth_reception_timeout();
+void *alert_pause_timeout();
+void *end_measure_timeout();
 
 // Prototype of initialization function
 int system_setup();
 
 // Other protoypes of functions
 void delay (int milliseconds);
+void udelay (int microseconds);
 const char * current_time();
 int ms_elapsed(struct timespec tm1, struct timespec tm2);
+int us_elapsed(struct timespec tm1, struct timespec tm2);
 void sort_array(int samples[MAXNUMSAMPLES], int length);
 int min (int a, int b);
+int max (int a, int b);
+static void MD5mod(const char* str, char hash[33]);
 
 #endif /* _Q4SCLIENT_H_ */
