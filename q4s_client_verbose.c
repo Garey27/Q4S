@@ -3292,14 +3292,14 @@ void Ping_Init (fsm_t* fsm) {
 
   if (stage == 2) {
 		pthread_mutex_lock(&mutex_session);
-		printf("\nStage 2 has started: Q4S PING exchange while application execution\n");
+		printf("\nStage 2 has started -> Q4S PING exchange while application execution\n");
 		pthread_mutex_unlock(&mutex_session);
 		// Starts timer for ping delivery in Stage 2
 		cancel_timer_ping_2 = false;
 		pthread_create(&timer_ping_2, NULL, (void*)ping_timeout_2, NULL);
 	} else {
 		pthread_mutex_lock(&mutex_session);
-		printf("\nStage 0 has started: Q4S PING exchange\n");
+		printf("\nStage 0 has started -> Q4S PING exchange\n");
 		pthread_mutex_unlock(&mutex_session);
 		// Starts timer for ping delivery in Stage 0
 		cancel_timer_ping_0 = false;
@@ -3463,7 +3463,7 @@ void Update (fsm_t* fsm) {
 				int rtt = ms_elapsed((&tm_latency_start1)->tm, (&tm_latency_end)->tm);
 
 				pthread_mutex_lock(&mutex_print);
-				fprintf(stderr,"\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
+				fprintf(stderr,"\nRTT = %d ms, and latency = %d ms\n", rtt, rtt/2);
 				pthread_mutex_unlock(&mutex_print);
 
 				pthread_mutex_lock(&mutex_session);
@@ -3473,7 +3473,7 @@ void Update (fsm_t* fsm) {
 				int rtt = ms_elapsed((&tm_latency_start2)->tm, (&tm_latency_end)->tm);
 
 				pthread_mutex_lock(&mutex_print);
-				fprintf(stderr,"\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
+				fprintf(stderr,"\nRTT = %d ms, and latency = %d ms\n", rtt, rtt/2);
 				pthread_mutex_unlock(&mutex_print);
 
 				pthread_mutex_lock(&mutex_session);
@@ -3483,7 +3483,7 @@ void Update (fsm_t* fsm) {
 				int rtt = ms_elapsed((&tm_latency_start3)->tm, (&tm_latency_end)->tm);
 
 				pthread_mutex_lock(&mutex_print);
-				fprintf(stderr,"\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
+				fprintf(stderr,"\nRTT = %d ms, and latency = %d ms\n", rtt, rtt/2);
 				pthread_mutex_unlock(&mutex_print);
 
 				pthread_mutex_lock(&mutex_session);
@@ -3493,7 +3493,7 @@ void Update (fsm_t* fsm) {
 				int rtt = ms_elapsed((&tm_latency_start4)->tm, (&tm_latency_end)->tm);
 
 				pthread_mutex_lock(&mutex_print);
-				fprintf(stderr,"\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
+				fprintf(stderr,"\nRTT = %d ms, and latency = %d ms\n", rtt, rtt/2);
 				pthread_mutex_unlock(&mutex_print);
 
 				pthread_mutex_lock(&mutex_session);
@@ -3742,7 +3742,7 @@ void Bwidth_Init (fsm_t* fsm) {
 	}
 	pthread_mutex_unlock(&mutex_session);
 	pthread_mutex_lock(&mutex_session);
-	printf("\nStage 1 has started: Q4S BWIDTH exchange\n");
+	printf("\nStage 1 has started -> Q4S BWIDTH exchange\n");
 	pthread_mutex_unlock(&mutex_session);
 	// Starts timer for bwidth delivery
 	cancel_timer_delivery_bwidth = false;

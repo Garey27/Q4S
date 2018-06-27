@@ -1,16 +1,22 @@
-#include "q4s_client_negotiation.h"
+#include "q4s_client.h"
 
-// GENERAL VARIABLES
+//-----------------------------------------------
+// VARIABLES
+//-----------------------------------------------
 
 // FOR Q4S SESSION MANAGING
 // Q4S session
 static type_q4s_session q4s_session;
 // Variable to store the flags
-int flags = 0;
+long int flags = 0;
+// Variable to store state machine
+fsm_t* q4s_fsm;
 
 // FOR CONNECTION MANAGING
 // Structs with info for the connection
 struct sockaddr_in client_TCP, client_UDP, server_TCP, server_UDP;
+// Variable with struct length
+socklen_t slen;
 // Struct with host info
 struct hostent *host;
 // Variable for socket assignment
@@ -23,14 +29,40 @@ char buffer_UDP[MAXDATASIZE];
 // FOR THREAD MANAGING
 // Thread to check reception of TCP data
 pthread_t receive_TCP_thread;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_TCP_thread;
 // Thread to check reception of UDP data
 pthread_t receive_UDP_thread;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_UDP_thread;
 // Thread to check pressed keys on the keyboard
 pthread_t keyboard_thread;
-// Thread acting as timer for ping delivery
-pthread_t timer_ping;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_keyboard_thread;
+// Thread acting as timer for ping delivery in Stage 0
+pthread_t timer_ping_0;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_timer_ping_0;
+// Thread acting as timer for preventive wait when finishing measures
+pthread_t timer_end_measure;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_timer_end_measure;
+// Thread acting as timer for ping delivery in Stage 2
+pthread_t timer_ping_2;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_timer_ping_2;
 // Thread acting as timer for bwidth delivery
-pthread_t timer_bwidth;
+pthread_t timer_delivery_bwidth;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_timer_delivery_bwidth;
+// Thread acting as timer for bwidth reception
+pthread_t timer_reception_bwidth;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_timer_reception_bwidth;
+// Thread acting as timer for alert pause
+pthread_t timer_alert;
+// Variable used to cancel a thread respecting the mutex
+bool cancel_timer_alert;
 // Variable for mutual exclusion with flags
 pthread_mutex_t mutex_flags;
 // Variable for mutual exclusion with q4s session
@@ -59,28 +91,44 @@ type_latency_tm tm_latency_end;
 struct timespec tm1_jitter;
 // Variable to store the time when next Q4S PING is received
 struct timespec tm2_jitter;
+// Variables to measure time elapsed in bwidth delivery
+struct timespec tm1_adjust;
+struct timespec tm2_adjust;
+
+// FOR SECURITY
+// Variable used as context when using MD5 algorithm
+MD5_CTX  md5_ctx;
 
 // AUXILIARY VARIABLES
+// Indicates the position of the last sample in the array
+int pos_latency;
+// Indicates the position of the last sample in the array
+int pos_elapsed_time;
+// Indicates the position of the last sample in the array
+int pos_packetloss;
+// Variable that stores the number of successful samples needed to pass to next stage
+int num_samples_succeed;
+// Variable that indicates if end_measure_timeout is activated
+bool end_measure_timeout_activated = false;
+// Variable that indicates if bwidth_reception_timeout is activated
+bool bwidth_reception_timeout_activated = false;
 // Variable used to obviate packet losses in jitter measure
 int num_ping;
 // Variable that indicates the number of new packet losses occurred
 int num_packet_lost;
-// Variable that indicates number of latency measures made by client
-int num_latency_measures_client;
-// Variable that indicates number of jitter measures made by client
-int num_jitter_measures_client;
-// Variable that indicates number of packetloss measures made by client
-int num_packetloss_measures_client;
-// Variable that indicates number of latency measures made by server
-int num_latency_measures_server;
-// Variable that indicates number of jitter measures made by server
-int num_jitter_measures_server;
-// Variable that indicates number of packetloss measures made by server
-int num_packetloss_measures_server;
+// Variable that stores the number of Q4S PING/BWIDTH sent since last alert
+int num_packet_since_alert;
 // Variable that shows number of Q4S BWIDTHs received in a period
 int num_bwidth_received;
+// Variable that stores number of failure messages received
+int num_failures;
+
+bool finished;
 
 
+//-----------------------------------------------
+// AUXILIARY FUNCTIONS
+//-----------------------------------------------
 
 // GENERAL FUNCTIONS
 
@@ -95,10 +143,28 @@ void delay (int milliseconds) {
 	}
 }
 
+// Waits for x microseconds
+void udelay (int microseconds) {
+	long pause;
+	clock_t now, then;
+	pause = microseconds*(CLOCKS_PER_SEC/1000000);
+	now = then = clock();
+	while((now-then) < pause) {
+		now = clock();
+	}
+}
+
 // Returns interval between two moments of time in ms
 int ms_elapsed(struct timespec tm1, struct timespec tm2) {
   unsigned long long t = 1000 * (tm2.tv_sec - tm1.tv_sec)
     + (tm2.tv_nsec - tm1.tv_nsec) / 1000000;
+	return t;
+}
+
+// Returns interval between two moments of time in us
+int us_elapsed(struct timespec tm1, struct timespec tm2) {
+  unsigned long long t = 1000000 * (tm2.tv_sec - tm1.tv_sec)
+    + (tm2.tv_nsec - tm1.tv_nsec) / 1000;
 	return t;
 }
 
@@ -153,11 +219,34 @@ int min (int a, int b) {
 	return a < b ? a:b;
 }
 
+// Returns the maximum value, given 2 integers
+int max (int a, int b) {
+	return a > b ? a:b;
+}
+
+// SECURITY FUNCTIONS
+
+// Creates the MD5 hash of a char array
+static void MD5mod(const char* str, char hash[33]) {
+    char digest[16];
+    int length = strlen(str);
+
+    MD5_Init(&md5_ctx);
+    MD5_Update(&md5_ctx, str, length);
+    MD5_Final(digest, &md5_ctx);
+
+    for (int i = 0; i < 16; ++i) {
+      sprintf(&hash[i*2], "%02x", (unsigned int)digest[i]);
+    }
+}
+
 // INITIALITATION FUNCTIONS
 
 // System initialitation
 // Creates a thread to explore keyboard and configures mutex
 int system_setup (void) {
+	slen = sizeof(server_UDP);
+
 	pthread_mutex_init(&mutex_flags, NULL);
 	pthread_mutex_init(&mutex_session, NULL);
 	pthread_mutex_init(&mutex_buffer_TCP, NULL);
@@ -165,6 +254,17 @@ int system_setup (void) {
 	pthread_mutex_init(&mutex_print, NULL);
 	pthread_mutex_init(&mutex_tm_latency, NULL);
 	pthread_mutex_init(&mutex_tm_jitter, NULL);
+
+	cancel_TCP_thread = false;
+	cancel_UDP_thread = false;
+	cancel_timer_ping_0 = false;
+	cancel_timer_ping_2 = false;
+	cancel_timer_alert = false;
+	cancel_timer_end_measure = false;
+	cancel_timer_delivery_bwidth = false;
+	cancel_timer_reception_bwidth = false;
+	cancel_keyboard_thread = false;
+
 	// Throws a thread to explore PC keyboard
 	pthread_create(&keyboard_thread, NULL, (void*)thread_explores_keyboard, NULL);
 	return 1;
@@ -202,6 +302,9 @@ void create_begin (type_q4s_message *q4s_message) {
 
 	char h3[100];
 	memset(h3, '\0', sizeof(h3));
+
+	char h4[100];
+	memset(h4, '\0', sizeof(h4));
 
   pthread_mutex_lock(&mutex_print);
 	printf("\nDo you want to specify desired quality thresholds? (yes/no): ");
@@ -329,6 +432,14 @@ void create_begin (type_q4s_message *q4s_message) {
 		strcat(body, a3);
 		strcat(body, a4);
 		strcat(body, a5);
+
+		// Creates a MD5 hash for the sdp and includes it in the header
+		char hash[33];
+		memset(hash, '\0', sizeof(hash));
+	  MD5mod(body, hash);
+		strcpy(h4, "Signature: ");
+		strcat(h4, hash);
+		strcat(h4, "\n");
 	}
 
   // Prepares some header fields
@@ -347,6 +458,9 @@ void create_begin (type_q4s_message *q4s_message) {
 	strcpy(header, h1);
 	strcat(header, h2);
 	strcat(header, h3);
+	if (strlen(h4) > 0) {
+		strcat(header, h4);
+	}
 
   // Delegates in a request creation function
   create_request (q4s_message,"BEGIN", header, body);
@@ -372,24 +486,35 @@ void create_ready0 (type_q4s_message *q4s_message) {
 	char h4[100];
 	memset(h4, '\0', sizeof(h4));
 
+	char h5[100];
+	memset(h5, '\0', sizeof(h5));
+
+	// Includes session ID
+	strcpy(h1, "Session-Id: ");
+	char s_session_id[20];
+	sprintf(s_session_id, "%d", (&q4s_session)->session_id);
+	strcat(h1, s_session_id);
+	strcat(h1, "\n");
+
   // Prepares some header fields
-	strcpy(h1, "Stage: 0\n");
-	strcpy(h2, "Content-Type: application/sdp\n");
-	strcpy(h3, "User-Agent: q4s-ua-experimental-1.0\n");
+	strcpy(h2, "Stage: 0\n");
+	strcpy(h3, "Content-Type: application/sdp\n");
+	strcpy(h4, "User-Agent: q4s-ua-experimental-1.0\n");
 
   // Includes body length in "Content Length" header field
-	strcpy(h4, "Content Length: ");
+	strcpy(h5, "Content Length: ");
 	int body_length = strlen(body);
 	char s_body_length[10];
 	sprintf(s_body_length, "%d", body_length);
-  strcat(h4, s_body_length);
-	strcat(h4, "\n");
+  strcat(h5, s_body_length);
+	strcat(h5, "\n");
 
   // Prepares header with header fields
 	strcpy(header, h1);
 	strcat(header, h2);
 	strcat(header, h3);
 	strcat(header, h4);
+	strcat(header, h5);
 
   // Delegates in a request creation function
   create_request (q4s_message,"READY", header, body);
@@ -397,7 +522,61 @@ void create_ready0 (type_q4s_message *q4s_message) {
 
 // Creation of Q4S READY 1 message
 void create_ready1 (type_q4s_message *q4s_message) {
-  char body[5000]; // it will be empty or filled with SDP parameters
+	char body[5000]; // it will be empty or filled with SDP parameters
+	memset(body, '\0', sizeof(body)); // body is empty by default
+
+	char header[500]; // it will be filled with header fields
+	memset(header, '\0', sizeof(header));
+
+	char h1[100];
+	memset(h1, '\0', sizeof(h1));
+
+	char h2[100];
+	memset(h2, '\0', sizeof(h2));
+
+	char h3[100];
+	memset(h3, '\0', sizeof(h3));
+
+	char h4[100];
+	memset(h4, '\0', sizeof(h4));
+
+	char h5[100];
+	memset(h5, '\0', sizeof(h5));
+
+	// Includes session ID
+	strcpy(h1, "Session-Id: ");
+	char s_session_id[20];
+	sprintf(s_session_id, "%d", (&q4s_session)->session_id);
+	strcat(h1, s_session_id);
+	strcat(h1, "\n");
+
+	// Prepares some header fields
+	strcpy(h2, "Stage: 1\n");
+	strcpy(h3, "Content-Type: application/sdp\n");
+	strcpy(h4, "User-Agent: q4s-ua-experimental-1.0\n");
+
+	// Includes body length in "Content Length" header field
+	strcpy(h5, "Content Length: ");
+	int body_length = strlen(body);
+	char s_body_length[10];
+	sprintf(s_body_length, "%d", body_length);
+	strcat(h5, s_body_length);
+	strcat(h5, "\n");
+
+	// Prepares header with header fields
+	strcpy(header, h1);
+	strcat(header, h2);
+	strcat(header, h3);
+	strcat(header, h4);
+	strcat(header, h5);
+
+	// Delegates in a request creation function
+	create_request (q4s_message,"READY", header, body);
+}
+
+// Creation of Q4S READY 2 message
+void create_ready2 (type_q4s_message *q4s_message) {
+	char body[5000]; // it will be empty or filled with SDP parameters
 	memset(body, '\0', sizeof(body)); // body is empty by default
 
 	char header[500]; // it will be filled with header fields
@@ -415,28 +594,40 @@ void create_ready1 (type_q4s_message *q4s_message) {
 	char h4[100];
 	memset(h4, '\0', sizeof(h4));
 
-	// Prepares some header fields
-	strcpy(h1, "Stage: 1\n");
-	strcpy(h2, "Content-Type: application/sdp\n");
-	strcpy(h3, "User-Agent: q4s-ua-experimental-1.0\n");
+	char h5[100];
+	memset(h5, '\0', sizeof(h5));
+
+	// Includes session ID
+	strcpy(h1, "Session-Id: ");
+	char s_session_id[20];
+	sprintf(s_session_id, "%d", (&q4s_session)->session_id);
+	strcat(h1, s_session_id);
+	strcat(h1, "\n");
+
+  // Prepares some header fields
+	strcpy(h2, "Stage: 2\n");
+	strcpy(h3, "Content-Type: application/sdp\n");
+	strcpy(h4, "User-Agent: q4s-ua-experimental-1.0\n");
 
   // Includes body length in "Content Length" header field
-	strcpy(h4, "Content Length: ");
+	strcpy(h5, "Content Length: ");
 	int body_length = strlen(body);
 	char s_body_length[10];
 	sprintf(s_body_length, "%d", body_length);
-  strcat(h4, s_body_length);
-	strcat(h4, "\n");
+  strcat(h5, s_body_length);
+	strcat(h5, "\n");
 
   // Prepares header with header fields
 	strcpy(header, h1);
 	strcat(header, h2);
 	strcat(header, h3);
 	strcat(header, h4);
+	strcat(header, h5);
 
   // Delegates in a request creation function
   create_request (q4s_message,"READY", header, body);
 }
+
 
 // Creation of Q4S PING message
 void create_ping (type_q4s_message *q4s_message) {
@@ -494,7 +685,7 @@ void create_ping (type_q4s_message *q4s_message) {
 		strcat(h5, " ");
 	}
 	strcat(h5, ", j=");
-	if((&q4s_session)->jitter_measure_client && (&q4s_session)->jitter_th[1]) {
+	if((&q4s_session)->jitter_measure_client >= 0 && (&q4s_session)->jitter_th[1]) {
 		char s_jitter[6];
 		sprintf(s_jitter, "%d", (&q4s_session)->jitter_measure_client);
     strcat(h5, s_jitter);
@@ -510,7 +701,7 @@ void create_ping (type_q4s_message *q4s_message) {
 		strcat(h5, " ");
 	}
 	strcat(h5, ", bw=");
-	if((&q4s_session)->bw_measure_client && (&q4s_session)->bw_th[1]) {
+	if((&q4s_session)->bw_measure_client >= 0 && (&q4s_session)->bw_th[1]) {
 		char s_bw[6];
 		sprintf(s_bw, "%d", (&q4s_session)->bw_measure_client);
     strcat(h5, s_bw);
@@ -652,7 +843,7 @@ void create_bwidth (type_q4s_message *q4s_message) {
 		strcat(h5, " ");
 	}
 	strcat(h5, ", j=");
-	if((&q4s_session)->jitter_measure_client && (&q4s_session)->jitter_th[1]) {
+	if((&q4s_session)->jitter_measure_client >= 0 && (&q4s_session)->jitter_th[1]) {
 		char s_jitter[6];
 		sprintf(s_jitter, "%d", (&q4s_session)->jitter_measure_client);
     strcat(h5, s_jitter);
@@ -668,7 +859,7 @@ void create_bwidth (type_q4s_message *q4s_message) {
 		strcat(h5, " ");
 	}
 	strcat(h5, ", bw=");
-	if((&q4s_session)->bw_measure_client && (&q4s_session)->bw_th[1]) {
+	if((&q4s_session)->bw_measure_client >= 0 && (&q4s_session)->bw_th[1]) {
 		char s_bw[6];
 		sprintf(s_bw, "%d", (&q4s_session)->bw_measure_client);
     strcat(h5, s_bw);
@@ -801,19 +992,26 @@ void create_response (type_q4s_message *q4s_message, char status_code[10],
 		strcpy((q4s_message)->body, body);
 }
 
-// Storage of a Q4S message just received
+// Validation and storage of a Q4S message just received
 // Converts from char[MAXDATASIZE] to type_q4s_message
-void store_message (char received_message[MAXDATASIZE], type_q4s_message *q4s_message) {
+bool store_message (char received_message[MAXDATASIZE], type_q4s_message *q4s_message) {
+	if (strlen(received_message) > 5700) {
+		pthread_mutex_lock(&mutex_print);
+		printf("\nMessage received is too long\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+
   // Auxiliary variables
 	char *fragment1;
   char *fragment2;
 
-  char start_line[200]; // to store start line
-  char header[500];  // to store header
-  char body[5000];  // to store body
+  char start_line[MAXDATASIZE]; // to store start line
+  char header[MAXDATASIZE];  // to store header
+  char body[MAXDATASIZE];  // to store body
 
-	memset(start_line, '\0', strlen(start_line));
-	memset(header, '\0', strlen(header));
+  memset(start_line, '\0', strlen(start_line));
+  memset(header, '\0', strlen(header));
 	memset(body, '\0', strlen(body));
 
   // Copies header + body
@@ -839,13 +1037,296 @@ void store_message (char received_message[MAXDATASIZE], type_q4s_message *q4s_me
 		memset(body, '\0', strlen(body));
 	}
 
-  // Stores Q4S message
+	// Creates a copy of start line to manipulate it
+	char copy_start_line[MAXDATASIZE];
+	memset(copy_start_line, '\0', strlen(copy_start_line));
+  strcpy(copy_start_line, start_line);
+
+	// Creates a copy of header to manipulate it
+	char copy_header[MAXDATASIZE];
+	memset(copy_header, '\0', strlen(copy_header));
+  strcpy(copy_header, header);
+
+	// Creates a copy of body to manipulate it
+	char copy_body[MAXDATASIZE];
+	memset(copy_body, '\0', strlen(copy_body));
+	strcpy(copy_body, body);
+
+
+	if (strlen(copy_start_line) > 200) {
+		pthread_mutex_lock(&mutex_print);
+		printf("\nURI received is too long\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+
+	if (strstr(copy_start_line, "\\") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "\a") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "\b") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "\f") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "\r") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "\t") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "\v") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, "<") != NULL) {
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	if (strstr(copy_start_line, ">") != NULL) {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nInvalid URI\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+	strcpy(copy_start_line, start_line);
+
+	// Auxiliary variable
+	char *fragment;
+	bool response;
+
+	fragment = strtok(copy_start_line, " ");
+
+	if (strcmp(fragment, "PING") == 0 || strcmp(fragment, "BWIDTH") == 0
+		|| strcmp(fragment, "CANCEL") == 0) {
+			response = false;
+	} else if (strcmp(fragment, "Q4S/1.0") == 0) {
+		response = true;
+	} else {
+		strcpy(copy_start_line, start_line);
+		pthread_mutex_lock(&mutex_print);
+		printf("\nUnknown method of received message\n");
+		pthread_mutex_unlock(&mutex_print);
+		return false;
+	}
+
+	if (!response) {
+		fragment = strtok(NULL, " ");
+		if (strstr(fragment, "q4s://") != NULL) {
+			fragment = strtok(NULL, "/");
+			if (strstr(fragment, "Q4S") != NULL) {
+				fragment = strtok(NULL, "\n");
+				if (strcmp(fragment, "1.0") == 0) {
+					strcpy(copy_start_line, start_line);
+				} else {
+					strcpy(copy_start_line, start_line);
+					pthread_mutex_lock(&mutex_print);
+					printf("\nServer is using a different version of QoS\n");
+					pthread_mutex_unlock(&mutex_print);
+					return false;
+				}
+			} else {
+				strcpy(copy_start_line, start_line);
+				pthread_mutex_lock(&mutex_print);
+				printf("\nInvalid format of start line\n");
+				pthread_mutex_unlock(&mutex_print);
+				return false;
+			}
+		} else {
+			strcpy(copy_start_line, start_line);
+			pthread_mutex_lock(&mutex_print);
+			printf("\nInvalid format of start line\n");
+			pthread_mutex_unlock(&mutex_print);
+			return false;
+		}
+	}
+
+	// If there is a Signature parameter in the header
+	if (fragment = strstr(copy_header, "Signature")){
+		fragment = fragment + 11; // moves to the beginning of the value
+		char *signature;
+		signature = strtok(fragment, "\n"); // stores value
+
+		// Creates a MD5 hash for the sdp
+		char hash[33];
+	  MD5mod(copy_body, hash);
+		if (strcmp(signature, hash) != 0) {
+			pthread_mutex_lock(&mutex_print);
+			printf("\nMD5 hash of the sdp doesn't coincide\n");
+			printf("\nSignature: %s\n", signature);
+			printf("\nHash: %s\n", hash);
+			printf("\nIntegrity of message has been violated\n");
+			pthread_mutex_unlock(&mutex_print);
+			return false;
+		}
+		memset(fragment, '\0', strlen(fragment));
+		strcpy(copy_body, body);  // restores copy of header
+	}
+	strcpy(copy_header, header); // restores copy of header
+
+	if (strlen(copy_body) > 0) {
+		if (strstr(copy_start_line, "BWIDTH") == NULL) {
+			// Checks if the body is in sdp format
+			if (fragment = strstr(copy_body, "a=")) {
+				memset(fragment, '\0', strlen(fragment));
+				strcpy(copy_body, body); // restores copy of header
+			} else {
+				strcpy(copy_body, body); // restores copy of header
+				pthread_mutex_lock(&mutex_print);
+				printf("\nUnrecognized format of body\n");
+				pthread_mutex_unlock(&mutex_print);
+				return false;
+			}
+		}
+
+		strcpy(copy_start_line, start_line);  // restores copy of start line
+
+		// If there is a QoS level parameter in the body
+		if (fragment = strstr(copy_body, "a=qos-level:")) {
+	    fragment = fragment + 12;  // moves to the beginning of the value
+			char *qos_level_up;
+			qos_level_up = strtok(fragment, "/");  // stores string value
+			if (atoi(qos_level_up) > 9 || atoi(qos_level_up) < 0) {
+				pthread_mutex_lock(&mutex_print);
+				printf("\nInvalid upstream QoS level\n");
+				pthread_mutex_unlock(&mutex_print);
+				return false;
+			}
+			char *qos_level_down;
+			qos_level_down = strtok(NULL, "\n");  // stores string value
+			if (atoi(qos_level_down) > 9 || atoi(qos_level_down) < 0) {
+				pthread_mutex_lock(&mutex_print);
+				printf("\nInvalid downstream QoS level\n");
+				pthread_mutex_unlock(&mutex_print);
+				return false;
+			}
+			memset(fragment, '\0', strlen(fragment));
+			strcpy(copy_body, body);  // restores copy of body
+		}
+	}
+
+	if ((&q4s_session)->session_id >= 0) {
+		// If there is a Session ID parameter in the header
+		if (fragment = strstr(copy_header, "Session-Id")) {
+			fragment = fragment + 12;  // moves to the beginning of the value
+			char *string_id;
+			string_id = strtok(fragment, "\n");  // stores string value
+			if ((&q4s_session)->session_id != atoi(string_id)) {
+				pthread_mutex_lock(&mutex_print);
+				printf("\nSession ID of the message doesn't coincide\n");
+				printf("\nID received: %d\n", atoi(string_id));
+				printf("\nActual ID: %d\n", (&q4s_session)->session_id);
+				pthread_mutex_unlock(&mutex_print);
+				memset(fragment, '\0', strlen(fragment));
+				strcpy(copy_header, header);  // restore copy of header
+				return false;
+			} else {
+				memset(fragment, '\0', strlen(fragment));
+				strcpy(copy_header, header);  // restore copy of header
+			}
+		} else if (fragment = strstr(copy_body, "o=")) {  // if Session ID is in the body
+			fragment = strstr(fragment, " ");  // moves to the beginning of the value
+			char *string_id;
+			string_id = strtok(fragment, " ");  // stores string value
+			if ((&q4s_session)->session_id != atoi(string_id)) {
+				pthread_mutex_lock(&mutex_print);
+				printf("\nSession ID of the message doesn't coincide\n");
+				pthread_mutex_unlock(&mutex_print);
+				memset(fragment, '\0', strlen(fragment));
+				strcpy(copy_header, header);  // restore copy of header
+				strcpy(copy_body, body);  // restores copy of body
+				return false;
+			} else {
+				memset(fragment, '\0', strlen(fragment));
+				strcpy(copy_header, header); // restores copy of header
+				strcpy(copy_body, body);  // restores copy of body
+			}
+		} else {
+			strcpy(copy_header, header); // restores copy of header
+			strcpy(copy_body, body);  // restores copy of body
+			pthread_mutex_lock(&mutex_print);
+			printf("\nMissing Session-Id header field in the message received\n");
+			pthread_mutex_unlock(&mutex_print);
+			return false;
+		}
+	}
+
+	if (strcmp(copy_start_line, "PING q4s://www.example.com Q4S/1.0") == 0
+	|| strcmp(copy_start_line, "BWIDTH q4s://www.example.com Q4S/1.0") == 0) {
+		// If there is a Sequence Number parameter in the header
+		if (fragment = strstr(copy_header, "Sequence-Number")) {
+			memset(fragment, '\0', strlen(fragment));
+			strcpy(copy_start_line, start_line);  // restores copy of start line
+			strcpy(copy_header, header); // restores copy of header
+		} else {
+			strcpy(copy_start_line, start_line);  // restores copy of start line
+			strcpy(copy_header, header); // restores copy of header
+			pthread_mutex_lock(&mutex_print);
+			printf("\nMissing Sequence-Number header field in the message received\n");
+			pthread_mutex_unlock(&mutex_print);
+			return false;
+		}
+	}
+
+	// Stores Q4S message
 	strcpy((q4s_message)->start_line, start_line);
-  strcpy((q4s_message)->header, header);
-  strcpy((q4s_message)->body, body);
+	strcpy((q4s_message)->header, header);
+	strcpy((q4s_message)->body, body);
+
+	return true;
 }
 
-// Q4S PARAMETER STORAGE FUNCTION
+
+// Q4S PARAMETER STORAGE FUNCTIONS
 
 // Storage of Q4S parameters from a Q4S message
 void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_message) {
@@ -877,10 +1358,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
   // Auxiliary variable
 	char *fragment;
 
-  pthread_mutex_lock(&mutex_print);
-	printf("\n");
-	pthread_mutex_unlock(&mutex_print);
-
 	// If session id is not known
 	if ((q4s_session)->session_id < 0) {
 		// If there is a Session ID parameter in the header
@@ -891,9 +1368,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			(q4s_session)->session_id = atoi(string_id);  // converts into int and stores
 			memset(fragment, '\0', strlen(fragment));
 			strcpy(copy_header, header);  // restore copy of header
-			pthread_mutex_lock(&mutex_print);
-			printf("Session ID stored: %d\n", (q4s_session)->session_id);
-			pthread_mutex_unlock(&mutex_print);
 		} else if (fragment = strstr(copy_body, "o=")) {  // if Session ID is in the body
 			fragment = strstr(fragment, " ");  // moves to the beginning of the value
 			char *string_id;
@@ -901,9 +1375,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			(q4s_session)->session_id = atoi(string_id);  // converts into int and stores
 			memset(fragment, '\0', strlen(fragment));
 			strcpy(copy_body, body);  // restores copy of header
-			pthread_mutex_lock(&mutex_print);
-			printf("Session ID stored: %d\n", (q4s_session)->session_id);
-			pthread_mutex_unlock(&mutex_print);
 		}
 	}
 
@@ -915,13 +1386,9 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->expiration_time = atoi(s_expires);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_header, header);  // restores copy of header
-		pthread_mutex_lock(&mutex_print);
-		printf("Expiration time stored: %d\n", (q4s_session)->expiration_time);
-		pthread_mutex_unlock(&mutex_print);
 	}
 
-  if (strcmp(copy_start_line, "PING q4s://www.example.com Q4S/1.0") == 0
-    || strcmp(copy_start_line, "BWIDTH q4s://www.example.com Q4S/1.0") == 0) {
+  if (strcmp(copy_start_line, "PING q4s://www.example.com Q4S/1.0") == 0) {
 		// If there is a Date parameter in the header
 		if (fragment = strstr(copy_header, "Timestamp")){
 			fragment = fragment + 11;  // moves to the beginning of the value
@@ -930,9 +1397,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			strcpy((q4s_session)->server_timestamp, s_date);  // stores
 			memset(fragment, '\0', strlen(fragment));
 			strcpy(copy_header, header);  // restores copy of header
-			pthread_mutex_lock(&mutex_print);
-			printf("Server timestamp stored: %s\n", (q4s_session)->server_timestamp);
-			pthread_mutex_unlock(&mutex_print);
 		}
 		// If there is a Sequence Number parameter in the header
 		if (fragment = strstr(copy_header, "Sequence-Number")){
@@ -942,9 +1406,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			(q4s_session)->seq_num_server = atoi(s_seq_num);  // converts into int and stores
 			memset(fragment, '\0', strlen(fragment));
 			strcpy(copy_header, header);  // restores copy of header
-			pthread_mutex_lock(&mutex_print);
-			printf("Sequence number of server stored: %d\n", (q4s_session)->seq_num_server);
-			pthread_mutex_unlock(&mutex_print);
 		}
 		// If there is a Measurements parameter in the header
 		if (fragment = strstr(copy_header, "Measurements")){
@@ -953,33 +1414,54 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			strtok(fragment, "=");
 			s_latency = strtok(NULL, ",");  // stores string value
 			if (strcmp(s_latency," ") != 0) {
-				num_latency_measures_server++;
 				(q4s_session)->latency_measure_server = atoi(s_latency);  // converts into int and stores
-				pthread_mutex_lock(&mutex_print);
-				printf("Latency measure of server stored: %d\n", (q4s_session)->latency_measure_server);
-	      pthread_mutex_unlock(&mutex_print);
 			}
 
 			char *s_jitter;
 			strtok(NULL, "=");
 			s_jitter = strtok(NULL, ",");  // stores string value
 			if (strcmp(s_jitter," ") != 0) {
-				num_jitter_measures_server++;
 				(q4s_session)->jitter_measure_server = atoi(s_jitter);  // converts into int and stores
-				pthread_mutex_lock(&mutex_print);
-				printf("Jitter measure of server stored: %d\n", (q4s_session)->jitter_measure_server);
-	      pthread_mutex_unlock(&mutex_print);
 			}
 
 			char *s_pl;
 			strtok(NULL, "=");
 			s_pl = strtok(NULL, ",");  // stores string value
       if (strcmp(s_pl," ") != 0) {
-				num_packetloss_measures_server++;
 				(q4s_session)->packetloss_measure_server = atof(s_pl);  // converts into int and stores
-				pthread_mutex_lock(&mutex_print);
-				printf("Packetloss measure of server stored: %.2f\n", (q4s_session)->packetloss_measure_server);
-	      pthread_mutex_unlock(&mutex_print);
+			}
+
+			strtok(NULL, "=");
+			strtok(NULL, "\n");
+			memset(fragment, '\0', strlen(fragment));
+			strcpy(copy_header, header);  // restores copy of header
+		}
+		strcpy(copy_start_line, start_line);  // restores copy of start line
+	}
+
+	if (strcmp(copy_start_line, "BWIDTH q4s://www.example.com Q4S/1.0") == 0) {
+		// If there is a Sequence Number parameter in the header
+		if (fragment = strstr(copy_header, "Sequence-Number")){
+			fragment = fragment + 17;  // moves to the beginning of the value
+			char *s_seq_num;
+			s_seq_num = strtok(fragment, "\n");  // stores string value
+			(q4s_session)->seq_num_server = atoi(s_seq_num);  // converts into int and stores
+			memset(fragment, '\0', strlen(fragment));
+			strcpy(copy_header, header);  // restores copy of header
+		}
+		// If there is a Measurements parameter in the header
+		if (fragment = strstr(copy_header, "Measurements")){
+			fragment = fragment + 14;  // moves to the beginning of the value
+			strtok(fragment, "=");
+			strtok(NULL, ",");
+			strtok(NULL, "=");
+			strtok(NULL, ",");
+
+			char *s_pl;
+			strtok(NULL, "=");
+			s_pl = strtok(NULL, ",");  // stores string value
+      if (strcmp(s_pl," ") != 0) {
+				(q4s_session)->packetloss_measure_server = atof(s_pl);  // converts into int and stores
 			}
 
 			char *s_bw;
@@ -987,9 +1469,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			s_bw = strtok(NULL, "\n");  // stores string value
       if (strcmp(s_bw," ") != 0) {
 				(q4s_session)->bw_measure_server = atoi(s_bw);  // converts into int and stores
-				pthread_mutex_lock(&mutex_print);
-				printf("Bandwidth measure of server stored: %d\n", (q4s_session)->bw_measure_server);
-	      pthread_mutex_unlock(&mutex_print);
 			}
 			memset(fragment, '\0', strlen(fragment));
 			strcpy(copy_header, header);  // restores copy of header
@@ -1006,9 +1485,15 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 			(q4s_session)->seq_num_confirmed = atoi(s_seq_num);  // converts into int and stores
 			memset(fragment, '\0', strlen(fragment));
 			strcpy(copy_header, header);  // restores copy of header
-			pthread_mutex_lock(&mutex_print);
-			printf("Sequence number confirmed: %d\n", (q4s_session)->seq_num_confirmed);
-			pthread_mutex_unlock(&mutex_print);
+		}
+		// If there is a Stage parameter in the header
+		if (fragment = strstr(copy_header, "Stage")){
+			fragment = fragment + 7;  // moves to the beginning of the value
+			char *s_stage;
+			s_stage = strtok(fragment, "\n");  // stores string value
+			(q4s_session)->stage = atoi(s_stage);  // converts into int and stores
+			memset(fragment, '\0', strlen(fragment));
+			strcpy(copy_header, header);  // restores copy of header
 		}
 	}
   // If there is a QoS level parameter in the body
@@ -1022,10 +1507,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->qos_level[1] = atoi(qos_level_down);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_body, body);  // restores copy of body
-		pthread_mutex_lock(&mutex_print);
-		printf("QoS levels stored: %d/%d\n", (q4s_session)->qos_level[0],
-		  (q4s_session)->qos_level[1]);
-		pthread_mutex_unlock(&mutex_print);
 	}
 
   // If there is an alert pause parameter in the body
@@ -1036,9 +1517,34 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->alert_pause = atoi(alert_pause);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_body, body);  // restores copy of body
-		pthread_mutex_lock(&mutex_print);
-		printf("Alert pause stored: %d\n", (q4s_session)->alert_pause);
-		pthread_mutex_unlock(&mutex_print);
+	}
+
+	// If there is a measurement procedure parameter in the body
+	if (fragment = strstr(copy_body, "a=measurement:procedure default(")) {
+    fragment = fragment + 32;  // moves to the beginning of the value
+		char *ping_interval_negotiation_client;
+		ping_interval_negotiation_client = strtok(fragment, "/");  // stores string value
+		(q4s_session)->ping_clk_negotiation_client = atoi(ping_interval_negotiation_client);  // converts into int and stores
+		char *ping_interval_negotiation_server;
+		ping_interval_negotiation_server = strtok(NULL, ",");  // stores string value
+		(q4s_session)->ping_clk_negotiation_server = atoi(ping_interval_negotiation_server);  // converts into int and stores
+		char *ping_interval_continuity;
+		ping_interval_continuity = strtok(NULL, "/");  // stores string value
+		(q4s_session)->ping_clk_continuity = atoi(ping_interval_continuity);  // converts into int and stores
+		char *bwidth_interval;
+		strtok(NULL, ",");
+		bwidth_interval = strtok(NULL, ",");  // stores string value
+		(q4s_session)->bwidth_clk = atoi(bwidth_interval);  // converts into int and stores
+		char *window_size_lj;
+		window_size_lj = strtok(NULL, "/");  // stores string value
+		(q4s_session)->window_size_latency_jitter = atoi(window_size_lj);  // converts into int and stores
+		char *window_size_pl;
+		strtok(NULL, ",");
+		window_size_pl = strtok(NULL, "/");  // stores string value
+		(q4s_session)->window_size_packetloss = atoi(window_size_pl);  // converts into int and stores
+		memset(fragment, '\0', strlen(fragment));
+		strcpy(copy_body, body);  // restores copy of body
+		num_samples_succeed = 4*max((q4s_session)->window_size_latency_jitter, (q4s_session)->window_size_packetloss);
 	}
 
   // If there is an latency parameter in the body
@@ -1049,9 +1555,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->latency_th = atoi(latency);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_body, body);  // restores copy of body
-		pthread_mutex_lock(&mutex_print);
-		printf("Latency threshold stored: %d\n", (q4s_session)->latency_th);
-		pthread_mutex_unlock(&mutex_print);
 	}
 
   // If there is an jitter parameter in the body
@@ -1065,10 +1568,6 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->jitter_th[1] = atoi(jitter_down);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_body, body);  // restores copy of body
-		pthread_mutex_lock(&mutex_print);
-		printf("Jitter thresholds stored: %d/%d\n", (q4s_session)->jitter_th[0],
-		  (q4s_session)->jitter_th[1]);
-		pthread_mutex_unlock(&mutex_print);
 	}
 
   // If there is an bandwidth parameter in the body
@@ -1082,47 +1581,53 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->bw_th[1] = atoi(bw_down);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_body, body);  // restores copy of body
-		pthread_mutex_lock(&mutex_print);
-		printf("Bandwidth thresholds stored: %d/%d\n", (q4s_session)->bw_th[0],
-		  (q4s_session)->bw_th[1]);
-		pthread_mutex_unlock(&mutex_print);
 
 		if ((q4s_session)->bw_th[0] > 0) {
-			int target_bwidth = (q4s_session)->bw_th[0]; // kbps
-			int message_size = MESSAGE_BWIDTH_SIZE * 8; // bits
-			float messages_fract_per_ms = ((float) target_bwidth / (float) message_size);
-			int messages_int_per_ms = floor(messages_fract_per_ms);
+	    int target_bwidth = (q4s_session)->bw_th[0]; // kbps
+	    int message_size = MESSAGE_BWIDTH_SIZE * 8; // bits
+			// Messages per ms (fractional value)
+	    float messages_fract_per_ms = ((float) target_bwidth / (float) message_size);
+			// Messages per ms (integer value)
+	    int messages_int_per_ms = floor(messages_fract_per_ms);
+			// Messages remaining per second
+	    int messages_per_s[10];
+			memset(messages_per_s, 0, sizeof(messages_per_s));
+	    messages_per_s[0] = (int) ceil((messages_fract_per_ms - (float) messages_int_per_ms) * 1000);
+	    int ms_per_message[11];
+			memset(ms_per_message, 0, sizeof(ms_per_message));
+			if (messages_int_per_ms > 0) {
+				 ms_per_message[0] = 1;
+			} else {
+				ms_per_message[0] = 0;
+			}
 
-			int messages_per_s[10];
-			messages_per_s[0] = (int) ((messages_fract_per_ms - (float) messages_int_per_ms) * 1000);
-		  int ms_per_message[11];
-			ms_per_message[0] = 1;
+	    int divisor;
 
-			int divisor;
-
-			for (int i = 0; i < 10; i++) {
-				divisor = 2;
-				while ((int) (1000/divisor) > messages_per_s[i]) {
-					divisor++;
-				}
-				ms_per_message[i+1] = divisor;
+	    for (int i = 0; i < 10; i++) {
+		    divisor = 2;
+		    while (((float)1000/divisor) > (float) messages_per_s[i]) {
+			    divisor++;
+		    }
+		    ms_per_message[i+1] = divisor;
 				if (messages_per_s[i] - (int) (1000/divisor) == 0) {
 					break;
 				} else if (messages_per_s[i] - (int) (1000/divisor) <= 1) {
-          ms_per_message[i+1]--;
+					ms_per_message[i+1]--;
 					break;
 				} else {
 					messages_per_s[i+1] = messages_per_s[i] - (int) (1000/divisor);
 			  }
-		  }
-			(q4s_session)->bwidth_messages_per_ms = messages_int_per_ms;
-			for (int j = 0; j < sizeof(ms_per_message); j++) {
-				if (ms_per_message[j] > 0) {
-					(q4s_session)->ms_per_bwidth_message[j] = ms_per_message[j];
-				} else {
-					break;
-				}
-			}
+	    }
+	    (q4s_session)->bwidth_messages_per_ms = messages_int_per_ms;
+			memset((q4s_session)->ms_per_bwidth_message, 0, sizeof((q4s_session)->ms_per_bwidth_message));
+			(q4s_session)->ms_per_bwidth_message[0] = ms_per_message[0];
+	    for (int j = 1; j < sizeof(ms_per_message); j++) {
+		    if (ms_per_message[j] > 0) {
+			    (q4s_session)->ms_per_bwidth_message[j] = ms_per_message[j];
+		    } else {
+			    break;
+		    }
+	    }
 		}
 	}
 
@@ -1137,51 +1642,8 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 		(q4s_session)->packetloss_th[1] = atof(pl_down);  // converts into int and stores
 		memset(fragment, '\0', strlen(fragment));
 		strcpy(copy_body, body);  // restores copy of body
-		pthread_mutex_lock(&mutex_print);
-		printf("Packetloss thresholds stored: %.*f/%.*f\n", 2,
-		  (q4s_session)->packetloss_th[0], 2, (q4s_session)->packetloss_th[1]);
-		pthread_mutex_unlock(&mutex_print);
 	}
 
-	// If there is a measurement procedure parameter in the body
-	if (fragment = strstr(copy_body, "a=measurement:procedure default(")) {
-    fragment = fragment + 32;  // moves to the beginning of the value
-		char *ping_interval_negotiation;
-		ping_interval_negotiation = strtok(fragment, "/");  // stores string value
-		(q4s_session)->ping_clk_negotiation = atoi(ping_interval_negotiation);  // converts into int and stores
-    pthread_mutex_lock(&mutex_print);
-		printf("Interval between Q4S PING stored (NEGOTIATION): %d\n", (q4s_session)->ping_clk_negotiation);
-    pthread_mutex_unlock(&mutex_print);
-		char *ping_interval_continuity;
-		strtok(NULL, ",");
-		ping_interval_continuity = strtok(NULL, "/");  // stores string value
-		(q4s_session)->ping_clk_continuity = atoi(ping_interval_continuity);  // converts into int and stores
-    pthread_mutex_lock(&mutex_print);
-		printf("Interval between Q4S PING stored (CONTINUITY): %d\n", (q4s_session)->ping_clk_continuity);
-    pthread_mutex_unlock(&mutex_print);
-		char *bwidth_interval;
-		strtok(NULL, ",");
-		bwidth_interval = strtok(NULL, ",");  // stores string value
-		(q4s_session)->bwidth_clk = atoi(bwidth_interval);  // converts into int and stores
-    pthread_mutex_lock(&mutex_print);
-		printf("Interval between Q4S BWIDTH stored: %d\n", (q4s_session)->bwidth_clk);
-    pthread_mutex_unlock(&mutex_print);
-		char *window_size_lj;
-		window_size_lj = strtok(NULL, "/");  // stores string value
-		(q4s_session)->window_size_latency_jitter = atoi(window_size_lj);  // converts into int and stores
-    pthread_mutex_lock(&mutex_print);
-		printf("Window size for latency and jitter stored: %d\n", (q4s_session)->window_size_latency_jitter);
-    pthread_mutex_unlock(&mutex_print);
-		char *window_size_pl;
-		strtok(NULL, ",");
-		window_size_pl = strtok(NULL, "/");  // stores string value
-		(q4s_session)->window_size_packetloss = atoi(window_size_pl);  // converts into int and stores
-    pthread_mutex_lock(&mutex_print);
-		printf("Window size for packet loss stored: %d\n", (q4s_session)->window_size_packetloss);
-    pthread_mutex_unlock(&mutex_print);
-		memset(fragment, '\0', strlen(fragment));
-		strcpy(copy_body, body);  // restores copy of body
-	}
 }
 
 
@@ -1189,187 +1651,219 @@ void store_parameters(type_q4s_session *q4s_session, type_q4s_message *q4s_messa
 
 // Updates and stores latency measures
 void update_latency(type_q4s_session *q4s_session, int latency_measured) {
-   int num_samples = 0;
-	 int window_size  = (q4s_session)->window_size_latency_jitter;
-	 for (int i=0; i < sizeof((q4s_session)->latency_samples); i++) {
-		 if ((q4s_session)->latency_samples[i] > 0) {
-			 num_samples++;
-		 } else {
-			 break;
-		 }
-	 }
-	 if (num_samples == window_size && window_size > 0) {
-		 for (int j=0; j < num_samples - 1; j++) {
-			 (q4s_session)->latency_samples[j] = (q4s_session)->latency_samples[j+1];
-		 }
-		 (q4s_session)->latency_samples[num_samples - 1] = latency_measured;
-		 pthread_mutex_lock(&mutex_print);
- 		 printf("\nWindow size reached for latency measure\n");
-     pthread_mutex_unlock(&mutex_print);
-	 } else {
-		 (q4s_session)->latency_samples[num_samples] = latency_measured;
-		 num_samples++;
-	 }
+	int window_size  = (q4s_session)->window_size_latency_jitter;
+	int ordered_window[window_size];
 
-   sort_array((q4s_session)->latency_samples, num_samples);
-	 if (num_samples % 2 == 0) {
-		 int median_elem1 = num_samples/2;
-		 int median_elem2 = num_samples/2 + 1;
-		 (q4s_session)->latency_measure_client = ((q4s_session)->latency_samples[median_elem1-1]
-		   + (q4s_session)->latency_samples[median_elem2-1]) / 2;
-	 } else {
-		 int median_elem = (num_samples + 1) / 2;
-		 (q4s_session)->latency_measure_client = (q4s_session)->latency_samples[median_elem-1];
-	 }
-	 pthread_mutex_lock(&mutex_print);
-	 printf("Updated value of latency measure: %d\n", (q4s_session)->latency_measure_client);
-	 pthread_mutex_unlock(&mutex_print);
+	// Updates array of latency samples and position of next sample
+	(q4s_session)->latency_samples[pos_latency] = latency_measured;
+	if (pos_latency == MAXNUMSAMPLES-1) {
+	 pos_latency = 0;
+	} else {
+	 pos_latency++;
+	}
+
+	// If the window is not being filled yet
+	if (pos_latency < window_size && (q4s_session)->latency_samples[pos_latency] == 0) {
+		// Adds sample to window and exits function
+		(q4s_session)->latency_window[pos_latency-1] = latency_measured;
+		return;
+	// Else if the window is continuous (not splitted)
+	} else if (pos_latency >= window_size){
+		// If the window is filled for the first time
+		if (pos_latency == window_size && (q4s_session)->latency_samples[pos_latency] == 0) {
+			// Adds sample to window
+		  (q4s_session)->latency_window[pos_latency-1] = latency_measured;
+		// Else if the window was already filled
+		} else {
+			int aux = 0;
+			// Updates window
+			for (int i = pos_latency-window_size; i < pos_latency; i++) {
+				(q4s_session)->latency_window[aux] = (q4s_session)->latency_samples[i];
+				aux++;
+			}
+		}
+	// Else if the window is splitted in two
+	} else {
+		int aux = 0;
+		// Updates window
+		for (int i = MAXNUMSAMPLES+pos_latency-window_size; i < MAXNUMSAMPLES; i++) {
+			(q4s_session)->latency_window[aux] = (q4s_session)->latency_samples[i];
+			aux++;
+		}
+		for (int i = 0; i < pos_latency; i++) {
+			(q4s_session)->latency_window[aux] = (q4s_session)->latency_samples[i];
+			aux++;
+		}
+	}
+
+	// Orders window samples
+	for (int i = 0; i < window_size; i++) {
+		ordered_window[i] = (q4s_session)->latency_window[i];
+	}
+	sort_array(ordered_window, window_size);
+
+  // Calculates mean value using statistical median formula
+	if (window_size % 2 == 0) {
+		int median_elem1 = window_size/2;
+		int median_elem2 = window_size/2 + 1;
+		(q4s_session)->latency_measure_client = (ordered_window[median_elem1-1]
+		  + ordered_window[median_elem2-1]) / 2;
+	} else {
+		int median_elem = (window_size + 1) / 2;
+		(q4s_session)->latency_measure_client = ordered_window[median_elem-1];
+	}
 }
 
 // Updates and stores latency measures
 void update_jitter(type_q4s_session *q4s_session, int elapsed_time) {
-	int num_samples = 0;
 	int window_size  = (q4s_session)->window_size_latency_jitter;
-	for (int i=0; i < sizeof((q4s_session)->elapsed_time_samples); i++) {
-		if ((q4s_session)->elapsed_time_samples[i] > 0) {
-			num_samples++;
-		} else {
-			break;
-		}
-	}
 
-	if (num_samples == window_size && window_size > 0) {
-		for (int j=0; j < num_samples - 1; j++) {
-			(q4s_session)->elapsed_time_samples[j] = (q4s_session)->elapsed_time_samples[j+1];
-		}
-		(q4s_session)->elapsed_time_samples[num_samples - 1] = elapsed_time;
-		pthread_mutex_lock(&mutex_print);
-		printf("\nWindow size reached for jitter measure\n");
-		pthread_mutex_unlock(&mutex_print);
+	// Updates array of elapsed time samples and position of next sample
+	(q4s_session)->elapsed_time_samples[pos_elapsed_time] = elapsed_time;
+	if (pos_elapsed_time == MAXNUMSAMPLES-1) {
+	 pos_elapsed_time = 0;
 	} else {
-		(q4s_session)->elapsed_time_samples[num_samples] = elapsed_time;
-		num_samples++;
+	 pos_elapsed_time++;
 	}
 
-	if (num_samples <= 1) {
+	// If the window is not being filled yet
+	if (pos_elapsed_time < max(window_size, 2) && (q4s_session)->elapsed_time_samples[pos_elapsed_time] == 0) {
+		// Adds sample to window and exits function
+		(q4s_session)->elapsed_time_window[pos_elapsed_time-1] = elapsed_time;
 		return;
-	} else {
-		int elapsed_time_mean = 0;
-		for (int j=0; j < num_samples - 1; j++) {
-			elapsed_time_mean = elapsed_time_mean + (q4s_session)->elapsed_time_samples[j];
+	// Else if the window is continuous (not splitted)
+	} else if (pos_elapsed_time >= window_size){
+		// If the window is filled for the first time
+		if (pos_elapsed_time == window_size && (q4s_session)->elapsed_time_samples[pos_elapsed_time] == 0) {
+			// Adds sample to window
+		  (q4s_session)->elapsed_time_window[pos_elapsed_time-1] = elapsed_time;
+		// Else if the window was already filled
+		} else {
+			int aux = 0;
+			// Updates window
+			for (int i = pos_elapsed_time-window_size; i < pos_elapsed_time; i++) {
+				(q4s_session)->elapsed_time_window[aux] = (q4s_session)->elapsed_time_samples[i];
+				aux++;
+			}
 		}
-		elapsed_time_mean = elapsed_time_mean / (num_samples - 1);
-		(q4s_session)->jitter_measure_client = abs(elapsed_time - elapsed_time_mean);
-		pthread_mutex_lock(&mutex_print);
-		printf("Updated value of jitter measure: %d\n", (q4s_session)->jitter_measure_client);
-    pthread_mutex_unlock(&mutex_print);
-		num_jitter_measures_client++;
+	// Else if the window is splitted in two
+	} else {
+		int aux = 0;
+		// Updates window
+		for (int i = MAXNUMSAMPLES+pos_elapsed_time-window_size; i < MAXNUMSAMPLES; i++) {
+			(q4s_session)->elapsed_time_window[aux] = (q4s_session)->elapsed_time_samples[i];
+			aux++;
+		}
+		for (int i = 0; i < pos_elapsed_time; i++) {
+			(q4s_session)->elapsed_time_window[aux] = (q4s_session)->elapsed_time_samples[i];
+			aux++;
+		}
 	}
+
+  // Calculates mean value using arithmetic mean formula
+	int elapsed_time_mean = 0;
+	for (int i = 0; i < window_size - 1; i++) {
+		elapsed_time_mean = elapsed_time_mean + (q4s_session)->elapsed_time_window[i];
+	}
+	elapsed_time_mean = elapsed_time_mean / (window_size - 1);
+	(q4s_session)->jitter_measure_client = abs(elapsed_time - elapsed_time_mean);
 }
 
 // Updates and stores packetloss measures
 void update_packetloss(type_q4s_session *q4s_session, int lost_packets) {
-	// Number of packets taken in account for measure
-	int num_samples = 0;
-	// Number of packets missed
-	int num_losses = 0;
-	// Maximum number of packets taken in account
-	int window_size = (q4s_session)->window_size_packetloss;
-	if (window_size == 0 || window_size > MAXNUMSAMPLES - 100) {
-		window_size = MAXNUMSAMPLES - 100;
-	}
+	int window_size  = (q4s_session)->window_size_packetloss;
 
-  // Discovers current value of num_samples and num_losses
-	for (int i=0; i < sizeof((q4s_session)->packetloss_samples); i++) {
-		// Losses are represented with a "1"
-		if ((q4s_session)->packetloss_samples[i] > 0) {
-			num_losses++;
-		} else if ((q4s_session)->packetloss_samples[i] == 0) {
-			break;
-		}
-		// Packets received are represented with a "-1"
-		num_samples++;
-	}
+	// Losses are represented with a "1"
+	// Packets received are represented with a "-1"
 
-  // If there are no packets lost in this measure
+	// Updates array of packetloss samples and position of next sample
+	// If there is no packet lost this time
 	if (lost_packets == 0) {
-		// Next sample is set to -1
-		(q4s_session)->packetloss_samples[num_samples] = -1;
-		num_samples++;
-
-		// If window_size has been overcome
-		if (num_samples > window_size) {
-			pthread_mutex_lock(&mutex_print);
-			printf("\nWindow size reached for packetloss measure\n");
-			pthread_mutex_unlock(&mutex_print);
-			// If first sample is a loss, num_losses is decreased by 1
-			if ((q4s_session)->packetloss_samples[0] > 0) {
-				num_losses--;
-			}
-			// Array of samples is moved one position to the left
-			for (int k=0; k < num_samples - 1; k++) {
-				(q4s_session)->packetloss_samples[k] = (q4s_session)->packetloss_samples[k+1];
-			}
-			// The old last position is put to 0
-			(q4s_session)->packetloss_samples[num_samples - 1] = 0;
-			// Decreases num_samples by 1
-			num_samples--;
+		(q4s_session)->packetloss_samples[pos_packetloss] = -1;
+		if (pos_packetloss >= MAXNUMSAMPLES - 1) {
+			pos_packetloss = 0;
+		} else {
+			pos_packetloss++;
 		}
-
-	} else {  // if there are losses
-		// If window_size is to be overcome
-		if (num_samples+lost_packets+1 > window_size) {
-			pthread_mutex_lock(&mutex_print);
-			printf("\nWindow size reached for packetloss measure\n");
-			pthread_mutex_unlock(&mutex_print);
-		}
-		// Lost samples are set to 1
-		for (int j=0; j < lost_packets; j++) {
-			// If window_size has been overcome
-			if (num_samples >= window_size) {
-				// If first sample is a loss, num_losses is decreased by 1
-				if ((q4s_session)->packetloss_samples[0] > 0) {
-					num_losses--;
-				}
-				// Array of samples is moved one position to the left
-				for (int k=0; k < num_samples - 1; k++) {
-					(q4s_session)->packetloss_samples[k] = (q4s_session)->packetloss_samples[k+1];
-				}
-				// The old last position is put to 0
-				(q4s_session)->packetloss_samples[num_samples - 1] = 0;
-				// Decreases num_samples by 1
-				num_samples--;
+	// If there are lost packets
+	} else {
+		// If array of samples is to be overcome
+		if (pos_packetloss + lost_packets >= MAXNUMSAMPLES) {
+			// Fills array until the end
+			for (int i = pos_packetloss; i < MAXNUMSAMPLES; i++) {
+				(q4s_session)->packetloss_samples[i] = 1;
 			}
-      (q4s_session)->packetloss_samples[num_samples] = 1;
+			// Restart filling the array
+			for (int i = 0; i < pos_packetloss + lost_packets - MAXNUMSAMPLES; i++) {
+				(q4s_session)->packetloss_samples[i] = 1;
+			}
+			// Last sample to fill is the received packet (-1)
+			(q4s_session)->packetloss_samples[pos_packetloss + lost_packets - MAXNUMSAMPLES] = -1;
+			// Updates position of next sample
+			pos_packetloss = pos_packetloss + lost_packets - MAXNUMSAMPLES + 1;
+		// If array of samples is not being overcome
+		} else {
+			// Adds new samples
+			for (int i = 0; i < lost_packets; i++) {
+				(q4s_session)->packetloss_samples[pos_packetloss] = 1;
+				pos_packetloss++;
+			}
+			// Last sample to add is the received packet
+			(q4s_session)->packetloss_samples[pos_packetloss] = -1;
+			pos_packetloss++;
+		}
+	}
+
+	// If the window is not going to be filled yet
+	if (pos_packetloss < window_size && (q4s_session)->packetloss_samples[pos_packetloss] == 0) {
+		// Updates to window and exits function
+		for (int i = 0; i < pos_packetloss; i++) {
+			(q4s_session)->packetloss_window[i] = (q4s_session)->packetloss_samples[i];
+		}
+		return;
+	// Else if the window is continuous (not splitted)
+	} else if (pos_packetloss >= window_size){
+		// If the window is fulfilled for the first time
+		if (pos_packetloss == window_size && (q4s_session)->packetloss_samples[pos_packetloss] == 0) {
+			// Updates window
+			for (int i = 0; i < pos_packetloss; i++) {
+				(q4s_session)->packetloss_window[i] = (q4s_session)->packetloss_samples[i];
+			}
+		// Else if the window was already fulfilled
+		} else {
+			int aux = 0;
+			// Updates window
+			for (int i = pos_packetloss-window_size; i < pos_packetloss; i++) {
+				(q4s_session)->packetloss_window[aux] = (q4s_session)->packetloss_samples[i];
+				aux++;
+			}
+		}
+	// Else if the window is splitted in two
+	} else {
+		int aux = 0;
+		// Updates window
+		for (int i = MAXNUMSAMPLES+pos_packetloss-window_size; i < MAXNUMSAMPLES; i++) {
+			(q4s_session)->packetloss_window[aux] = (q4s_session)->packetloss_samples[i];
+			aux++;
+		}
+		for (int i = 0; i < pos_packetloss; i++) {
+			(q4s_session)->packetloss_window[aux] = (q4s_session)->packetloss_samples[i];
+			aux++;
+		}
+	}
+
+	// Stores number of samples of the window indicating a loss
+	int num_losses = 0;
+	for (int i = 0; i < window_size; i++) {
+		if ((q4s_session)->packetloss_window[i] == 1) {
 			num_losses++;
-			num_samples++;
 		}
-		// If window_size has been overcome
-		if (num_samples >= window_size) {
- 		  // If first sample is a loss, num_losses is decreased by 1
- 			if ((q4s_session)->packetloss_samples[0] > 0) {
- 				num_losses--;
- 			}
- 			// Array of samples is moved one position to the left
- 			for (int k=0; k < num_samples - 1; k++) {
- 				(q4s_session)->packetloss_samples[k] = (q4s_session)->packetloss_samples[k+1];
- 			}
- 			// The old last position is put to 0
- 			(q4s_session)->packetloss_samples[num_samples - 1] = 0;
- 			// Decreases num_samples by 1
- 			num_samples--;
-	  }
-		// Last sample is set to -1 (received packet)
-		(q4s_session)->packetloss_samples[num_samples] = -1;
-		num_samples++;
 	}
 
   // Calculates updated value of packetloss
-  (q4s_session)->packetloss_measure_client = ((float) num_losses / (float) num_samples);
-	pthread_mutex_lock(&mutex_print);
-	printf("Updated value of packetloss measure: %.2f\n", (q4s_session)->packetloss_measure_client);
-  pthread_mutex_unlock(&mutex_print);
+  (q4s_session)->packetloss_measure_client = ((float) num_losses / (float) window_size);
 }
+
 
 
 // CONNECTION FUNCTIONS
@@ -1405,10 +1899,6 @@ int connect_to_server() {
 		return -1;
 	}
 
-  pthread_mutex_lock(&mutex_print);
-	printf("\nTCP socket assigned to %s:%d\n", inet_ntoa(client_TCP.sin_addr), htons(client_TCP.sin_port));
-  pthread_mutex_unlock(&mutex_print);
-
 	if ((socket_UDP =  socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) { // socket assignment
     pthread_mutex_lock(&mutex_print);
 		printf("Error when assigning the UDP socket: %s\n", strerror(errno));
@@ -1431,15 +1921,11 @@ int connect_to_server() {
 		return -1;
 	}
 
-	pthread_mutex_lock(&mutex_print);
-	printf("UDP socket assigned to %s:%d\n", inet_ntoa(client_UDP.sin_addr), htons(client_UDP.sin_port));
-  pthread_mutex_unlock(&mutex_print);
-
 	// Especifies parameters of the server (UDP socket)
   server_UDP.sin_family = AF_INET; // protocol assignment
 	server_UDP.sin_port = htons(HOST_PORT_UDP); // port assignment
 	server_UDP.sin_addr = *((struct in_addr *)host->h_addr); // copies host IP address
-  memset(server_TCP.sin_zero, '\0', 8); // fills padding with 0s
+  memset(server_UDP.sin_zero, '\0', 8); // fills padding with 0s
 
   // Especifies parameters of the server (TCP socket)
   server_TCP.sin_family = AF_INET; // protocol assignment
@@ -1447,9 +1933,6 @@ int connect_to_server() {
 	server_TCP.sin_addr = *((struct in_addr *)host->h_addr); // copies host IP address
   memset(server_TCP.sin_zero, '\0', 8); // fills padding with 0s
 
-  pthread_mutex_lock(&mutex_print);
-  printf("Willing to connect to %s:%d\n", inet_ntoa(server_TCP.sin_addr), htons(server_TCP.sin_port));
-  pthread_mutex_unlock(&mutex_print);
 	// Connects to the host (Q4S server)
 	if (connect(socket_TCP,(struct sockaddr *)&server_TCP, sizeof(server_TCP)) < 0) {
     pthread_mutex_lock(&mutex_print);
@@ -1459,8 +1942,9 @@ int connect_to_server() {
 		return -1;
 	}
 	pthread_mutex_lock(&mutex_print);
-	printf("Connected to %s:%d\n", inet_ntoa(server_TCP.sin_addr), htons(server_TCP.sin_port));
+	printf("\nConnected to %s:%d\n", inet_ntoa(server_TCP.sin_addr), htons(server_TCP.sin_port));
   pthread_mutex_unlock(&mutex_print);
+
 	return 1;
 }
 
@@ -1482,10 +1966,6 @@ void send_message_TCP (char prepared_message[MAXDATASIZE]) {
 		return;
 	}
 
-	pthread_mutex_lock(&mutex_print);
-	printf("\nI have sent:\n%s\n", buffer_TCP);
-	pthread_mutex_unlock(&mutex_print);
-
   pthread_mutex_lock(&mutex_buffer_TCP);
 	memset(buffer_TCP, '\0', sizeof(buffer_TCP));
 	pthread_mutex_unlock(&mutex_buffer_TCP);
@@ -1493,9 +1973,9 @@ void send_message_TCP (char prepared_message[MAXDATASIZE]) {
 
 // Delivery of Q4S message to the server using UDP
 void send_message_UDP (char prepared_message[MAXDATASIZE]) {
-  int slen = sizeof(server_UDP);
 	char copy_buffer_UDP[MAXDATASIZE];
 	memset(copy_buffer_UDP, '\0', sizeof(copy_buffer_UDP));
+
   pthread_mutex_lock(&mutex_buffer_UDP);
 	memset(buffer_UDP, '\0', sizeof(buffer_UDP));
 	// Copies the message into the buffer
@@ -1539,37 +2019,37 @@ void send_message_UDP (char prepared_message[MAXDATASIZE]) {
 					(&tm_latency_start4)->seq_number = (&q4s_session)->seq_num_client;
 				}
 		}
-
+		pthread_mutex_unlock(&mutex_tm_latency);
 		if (result < 0) {
-	    pthread_mutex_lock(&mutex_print);
+	  	pthread_mutex_lock(&mutex_print);
 			printf("Error in clock_gettime(): %s\n", strerror(errno));
-	    pthread_mutex_unlock(&mutex_print);
+	  	pthread_mutex_unlock(&mutex_print);
 			close(socket_UDP);
-	    return;
+	  	return;
 		}
-    pthread_mutex_unlock(&mutex_tm_latency);
 	}
-
 	// Sends the message to the server using the UDP socket assigned
 	if (sendto(socket_UDP, buffer_UDP, MAXDATASIZE, 0, (struct sockaddr *) &server_UDP, slen) < 0) {
 		pthread_mutex_lock(&mutex_print);
-		printf("Error when sending UDP data: %s\n", strerror(errno));
+		printf("Error when sending UDP data: %s (%d)\n", strerror(errno), errno);
 		pthread_mutex_unlock(&mutex_print);
 		close(socket_UDP);
 		exit(0);
 		return;
 	}
 	pthread_mutex_lock(&mutex_buffer_UDP);
-	memset(copy_buffer_UDP, '\0', sizeof(copy_buffer_UDP));
-	strncpy(copy_buffer_UDP, buffer_UDP, MAXDATASIZE);
 	memset(buffer_UDP, '\0', sizeof(buffer_UDP));
 	pthread_mutex_unlock(&mutex_buffer_UDP);
 
-	pthread_mutex_lock(&mutex_print);
-	printf("\nI have sent:\n%s\n", copy_buffer_UDP);
-	pthread_mutex_unlock(&mutex_print);
+	memset(copy_buffer_UDP, '\0', sizeof(copy_buffer_UDP));
 }
 
+
+//---------------------------------------------------------
+// THREADS
+//---------------------------------------------------------
+
+// RECEPTION FUNCTIONS
 
 // Reception of Q4S messages from the server (TCP socket)
 // Thread function that checks if any message has arrived
@@ -1585,43 +2065,33 @@ void *thread_receives_TCP() {
 			pthread_mutex_lock(&mutex_print);
 		  printf("Error when receiving TCP data: %s\n", strerror(errno));
 			pthread_mutex_unlock(&mutex_print);
-		  close(socket_TCP);
-			exit(0);
-		  return NULL;
-		// If nothing has been received
+		  break;
 	  }
 		pthread_mutex_lock(&mutex_buffer_TCP);
-		if (strlen(buffer_TCP) == 0) {
-			pthread_mutex_unlock(&mutex_buffer_TCP);
-		  return NULL;
-    }
 		strcpy(copy_buffer_TCP, buffer_TCP);
 		strcpy(copy_buffer_TCP_2, buffer_TCP);
 		memset(buffer_TCP, '\0', sizeof(buffer_TCP));
 		pthread_mutex_unlock(&mutex_buffer_TCP);
+
+		pthread_mutex_lock(&mutex_session);
+		// Validates and stores the received message to be analized later
+		bool stored = store_message(copy_buffer_TCP, &q4s_session.message_received);
+		pthread_mutex_unlock(&mutex_session);
+
+		if (!stored) {
+			continue;
+		}
+
 		// Auxiliary variable to identify type of Q4S message
 		char *start_line;
-		start_line = strtok(copy_buffer_TCP, "\n"); // stores first line of message
+		start_line = strtok(copy_buffer_TCP_2, "\n"); // stores first line of message
 		// If it is a Q4S 200 OK message
 		if (strcmp(start_line, "Q4S/1.0 200 OK") == 0) {
-			// Stores the received message to be analized later
-			pthread_mutex_lock(&mutex_session);
-			store_message(copy_buffer_TCP_2, &q4s_session.message_received);
-		  pthread_mutex_unlock(&mutex_session);
-
-			pthread_mutex_lock(&mutex_print);
-			printf("\nI have received a Q4S 200 OK!\n");
-			pthread_mutex_unlock(&mutex_print);
-
 			pthread_mutex_lock(&mutex_flags);
 			flags |= FLAG_RECEIVE_OK;
 			pthread_mutex_unlock(&mutex_flags);
 		// If it is a Q4S CANCEL message
-	  } else if (strcmp(start_line, "CANCEL q4s://www.example.com Q4S/1.0") == 0) {
-			// Stores the received message to be analized later
-			pthread_mutex_lock(&mutex_session);
-			store_message(copy_buffer_TCP_2, &q4s_session.message_received);
-		  pthread_mutex_unlock(&mutex_session);
+		} else if (strcmp(start_line, "CANCEL q4s://www.example.com Q4S/1.0") == 0) {
 
 			pthread_mutex_lock(&mutex_print);
 			printf("\nI have received a Q4S CANCEL!\n");
@@ -1630,6 +2100,30 @@ void *thread_receives_TCP() {
 			pthread_mutex_lock(&mutex_flags);
 			flags |= FLAG_RECEIVE_CANCEL;
 			pthread_mutex_unlock(&mutex_flags);
+		} else if (strstr(start_line, "Q4S/1.0 4") != NULL || strstr(start_line, "Q4S/1.0 5") != NULL
+	 		|| strstr(start_line, "Q4S/1.0 6") != NULL) {
+				pthread_mutex_lock(&mutex_print);
+				printf("\nI have received a failure message:\n%s\n", copy_buffer_TCP);
+				pthread_mutex_unlock(&mutex_print);
+
+				num_failures++;
+
+				delay(1000);
+
+				if (num_failures < 5) {
+					pthread_mutex_lock(&mutex_flags);
+					flags |= FLAG_CANCEL;
+					pthread_mutex_unlock(&mutex_flags);
+				} else {
+					pthread_mutex_lock(&mutex_print);
+				  printf("\n5 or more messages of failure received in this session\n");
+					pthread_mutex_unlock(&mutex_print);
+
+					pthread_mutex_lock(&mutex_flags);
+					flags |= FLAG_RECEIVE_CANCEL;
+					pthread_mutex_unlock(&mutex_flags);
+				}
+
 		} else {
 			pthread_mutex_lock(&mutex_print);
 		  printf("\nI have received an unidentified message\n");
@@ -1637,13 +2131,15 @@ void *thread_receives_TCP() {
 	  }
 	  memset(copy_buffer_TCP, '\0', sizeof(copy_buffer_TCP));
 	  memset(copy_buffer_TCP_2, '\0', sizeof(copy_buffer_TCP_2));
-  }
+		if (cancel_TCP_thread) {
+			break;
+		}
+	}
 }
 
 // Reception of Q4S messages from the server (UDP socket)
 // Thread function that checks if any message has arrived
 void *thread_receives_UDP() {
-	int slen = sizeof(server_UDP);
 	// Copy of the buffer (to avoid buffer modification)
 	char copy_buffer_UDP[MAXDATASIZE];
 	memset(copy_buffer_UDP, '\0', sizeof(copy_buffer_UDP));
@@ -1653,35 +2149,35 @@ void *thread_receives_UDP() {
 		// If error occurs when receiving
 	  if (recvfrom(socket_UDP, buffer_UDP, MAXDATASIZE, MSG_WAITALL,
 			(struct sockaddr *) &server_UDP, &slen) < 0) {
-
 			pthread_mutex_lock(&mutex_print);
 		  printf("Error when receiving UDP data: %s\n", strerror(errno));
 			pthread_mutex_unlock(&mutex_print);
-		  close(socket_UDP);
-			exit(0);
-		  return NULL;
-		// If nothing has been received
+		  break;
 	  }
 		pthread_mutex_lock(&mutex_buffer_UDP);
-		if (strlen(buffer_UDP) == 0) {
-			pthread_mutex_unlock(&mutex_buffer_UDP);
-		  return NULL;
-    }
 		strcpy(copy_buffer_UDP, buffer_UDP);
 		strcpy(copy_buffer_UDP_2, buffer_UDP);
 		memset(buffer_UDP, '\0', sizeof(buffer_UDP));
 		pthread_mutex_unlock(&mutex_buffer_UDP);
+
+		pthread_mutex_lock(&mutex_session);
+		// Validates and stores the received message to be analized later
+		bool stored = store_message(copy_buffer_UDP, &q4s_session.message_received);
+		pthread_mutex_unlock(&mutex_session);
+
+		if (!stored) {
+			continue;
+		}
+
 		// Auxiliary variable to identify type of Q4S message
 		char *start_line;
-		start_line = strtok(copy_buffer_UDP, "\n"); // stores first line of message
+		start_line = strtok(copy_buffer_UDP_2, "\n"); // stores first line of message
 		// If it is a Q4S 200 OK message
 		if (strcmp(start_line, "Q4S/1.0 200 OK") == 0) {
 			char field_seq_num[20];
 			strcpy(field_seq_num, "Sequence-Number: ");
 			char header[500];
 			pthread_mutex_lock(&mutex_session);
-			// Stores the received message to be analized later
-			store_message(copy_buffer_UDP_2, &q4s_session.message_received);
 			strcpy(header, (&q4s_session.message_received)->header);
 			pthread_mutex_unlock(&mutex_session);
 
@@ -1696,10 +2192,6 @@ void *thread_receives_UDP() {
 				}
 				pthread_mutex_unlock(&mutex_tm_latency);
 
-				pthread_mutex_lock(&mutex_print);
-				printf("\nI have received a Q4S 200 OK!\n");
-				pthread_mutex_unlock(&mutex_print);
-
 				pthread_mutex_lock(&mutex_session);
 	      // Stores parameters of the message (included Sequence Number)
 				store_parameters(&q4s_session, &(q4s_session.message_received));
@@ -1713,10 +2205,6 @@ void *thread_receives_UDP() {
 				pthread_mutex_lock(&mutex_flags);
 				flags |= FLAG_RECEIVE_OK;
 				pthread_mutex_unlock(&mutex_flags);
-			} else {
-				pthread_mutex_lock(&mutex_print);
-			  printf("\nI have received a Q4S 200 OK without sequence number specified\n");
-				pthread_mutex_unlock(&mutex_print);
 			}
 		// If it is a Q4S PING message
 		} else if (strcmp(start_line, "PING q4s://www.example.com Q4S/1.0") == 0) {
@@ -1724,16 +2212,10 @@ void *thread_receives_UDP() {
 			strcpy(field_seq_num, "Sequence-Number: ");
 			char header[500];
 			pthread_mutex_lock(&mutex_session);
-			// Stores the received message to be analized later
-			store_message(copy_buffer_UDP_2, &q4s_session.message_received);
 			strcpy(header, (&q4s_session.message_received)->header);
 			pthread_mutex_unlock(&mutex_session);
 
 			if (strstr(header, field_seq_num) != NULL) {
-				pthread_mutex_lock(&mutex_print);
-			  printf("\nI have received a Q4S PING!\n");
-	      pthread_mutex_unlock(&mutex_print);
-
 				int seq_num_before;
 				int seq_num_after;
 				int num_losses;
@@ -1770,10 +2252,6 @@ void *thread_receives_UDP() {
 			  flags |= FLAG_RECEIVE_PING;
 			  pthread_mutex_unlock(&mutex_flags);
 
-			} else {
-				pthread_mutex_lock(&mutex_print);
-			  printf("\nI have received a Q4S PING without sequence number specified\n");
-				pthread_mutex_unlock(&mutex_print);
 			}
 		// If it is a Q4S BWIDTH message
 	  } else if (strcmp(start_line, "BWIDTH q4s://www.example.com Q4S/1.0") == 0) {
@@ -1781,26 +2259,28 @@ void *thread_receives_UDP() {
 			strcpy(field_seq_num, "Sequence-Number: ");
 			char header[500];
 			pthread_mutex_lock(&mutex_session);
-			// Stores the received message to be analized later
-			store_message(copy_buffer_UDP_2, &q4s_session.message_received);
 			strcpy(header, (&q4s_session.message_received)->header);
 			pthread_mutex_unlock(&mutex_session);
 
 			if (strstr(header, field_seq_num) != NULL) {
-				pthread_mutex_lock(&mutex_print);
-				printf("\nI have received a Q4S BWIDTH!\n");
-				pthread_mutex_unlock(&mutex_print);
-
 				int seq_num_before;
 				int seq_num_after;
 				int num_losses;
 
 				pthread_mutex_lock(&mutex_session);
-				num_bwidth_received++;
+				if (num_bwidth_received > 0) {
+					num_bwidth_received++;
+				}
 				seq_num_before = (&q4s_session)->seq_num_server;
 	      // Stores parameters of the message (included Sequence Number)
 				store_parameters(&q4s_session, &(q4s_session.message_received));
 				seq_num_after = (&q4s_session)->seq_num_server;
+				if (seq_num_after == 0 && !bwidth_reception_timeout_activated) {
+					// Starts timer for bwdith reception
+					cancel_timer_reception_bwidth = false;
+					pthread_create(&timer_reception_bwidth, NULL, (void*)bwidth_reception_timeout, NULL);
+					num_bwidth_received = 1;
+				}
 				num_losses = seq_num_after - (seq_num_before + 1);
 				num_packet_lost = num_losses;
 				pthread_mutex_unlock(&mutex_session);
@@ -1809,30 +2289,24 @@ void *thread_receives_UDP() {
 			  flags |= FLAG_RECEIVE_BWIDTH;
 			  pthread_mutex_unlock(&mutex_flags);
 
-			} else {
-				pthread_mutex_lock(&mutex_print);
-			  printf("\nI have received a Q4S BWIDTH without sequence number specified\n");
-				pthread_mutex_unlock(&mutex_print);
 			}
-
-		} else {
-			pthread_mutex_lock(&mutex_print);
-		  printf("\nI have received an unidentified message\n");
-			pthread_mutex_unlock(&mutex_print);
-	  }
+		}
 	  memset(copy_buffer_UDP, '\0', sizeof(copy_buffer_UDP));
 	  memset(copy_buffer_UDP_2, '\0', sizeof(copy_buffer_UDP_2));
+		if (cancel_UDP_thread) {
+			break;
+		}
   }
 }
 
 // TIMER FUNCTIONS
 
-// Activates a flag when ping timeout has occurred
-void *ping_timeout() {
+// Activates a flag when ping timeout has occurred in Stage 0
+void *ping_timeout_0() {
 	int ping_clk;
 	while(1) {
 		pthread_mutex_lock(&mutex_session);
-		ping_clk = q4s_session.ping_clk_negotiation;
+		ping_clk = q4s_session.ping_clk_negotiation_client;
 		pthread_mutex_unlock(&mutex_session);
 
     delay(ping_clk);
@@ -1840,83 +2314,323 @@ void *ping_timeout() {
 		pthread_mutex_lock(&mutex_flags);
 		flags |= FLAG_TEMP_PING_0;
 		pthread_mutex_unlock(&mutex_flags);
+
+		if (cancel_timer_ping_0) {
+			break;
+		}
 	}
 }
 
+// Activates a flag when preventive timeout has passed
+void *end_measure_timeout() {
+	pthread_mutex_lock(&mutex_session);
+	end_measure_timeout_activated = true;
+	int stage = q4s_session.stage;
+	pthread_mutex_unlock(&mutex_session);
+	int counter;
+	bool delivery_server_finished;
 
-// Activates a flag when bwidth timeout has occurred
-void *bwidth_timeout() {
-	int bwidth_clk; // time established for BWIDTH delivery
-	int messages_per_ms; // BWIDTH messages to send each 1 ms
-	int ms_per_message[11]; // intervals of ms for sending BWIDTH messages
-	int ms_delayed; // ms passed
-
-  while(1) {
-		// Initializes parameters needed
-		ms_delayed = 0;
-		pthread_mutex_lock(&mutex_session);
-		bwidth_clk = q4s_session.bwidth_clk;
-		messages_per_ms = q4s_session.bwidth_messages_per_ms;
-		for (int i = 0; i < sizeof(ms_per_message); i++) {
-			if (q4s_session.ms_per_bwidth_message[i] > 0) {
-				ms_per_message[i] = q4s_session.ms_per_bwidth_message[i];
-			} else {
-				break;
-			}
-		}
-		pthread_mutex_unlock(&mutex_session);
-
-	  pthread_mutex_lock(&mutex_print);
-		printf("\nBwidth clk: %d", bwidth_clk);
-		printf("\nMessages per ms: %d", messages_per_ms);
-		for (int i = 0; i < sizeof(ms_per_message); i++) {
-			if (ms_per_message[i] > 0) {
-				printf("\nMs per message (%d): %d\n", i+1, ms_per_message[i]);
-			} else {
-				break;
-			}
-		}
-		pthread_mutex_unlock(&mutex_print);
-
-		// Start of Q4S BWIDTH delivery
+	if (stage == 0) {
 		while(1) {
-			// Sends a number specified of 1kB BWIDTH messages per 1 ms
-			int j = 0;
-			while (j < messages_per_ms) {
-				pthread_mutex_lock(&mutex_flags);
-				flags |= FLAG_TEMP_BWIDTH;
-				pthread_mutex_unlock(&mutex_flags);
-				j++;
-			}
-			// Sends (when appropiate) 1 or more extra BWIDTH message(s) of 1kB
-			for (int k = 1; k < sizeof(ms_per_message); k++) {
-				if (ms_per_message[k] > 0 && ms_delayed % ms_per_message[k] == 0) {
-					pthread_mutex_lock(&mutex_flags);
-					flags |= FLAG_TEMP_BWIDTH;
+			int ping_clk_server;
+			int seq_num_init;
+			int seq_num_now;
+			pthread_mutex_lock(&mutex_session);
+			ping_clk_server = q4s_session.ping_clk_negotiation_server;
+			seq_num_init = q4s_session.seq_num_server;
+			delivery_server_finished = (((&q4s_session)->latency_th <= 0 ||
+				(&q4s_session)->latency_measure_server <= (&q4s_session)->latency_th)
+				&& ((&q4s_session)->jitter_th[1] <= 0 ||
+				(&q4s_session)->jitter_measure_client <= (&q4s_session)->jitter_th[1])
+				&& ((&q4s_session)->packetloss_th[1] <= 0 ||
+				(&q4s_session)->packetloss_measure_client <= (&q4s_session)->packetloss_th[1]));
+			pthread_mutex_unlock(&mutex_session);
+			// counter * ping_clk_server is the timeout, restarted when a Q4S PING is received
+			counter = 10;
+			seq_num_now = seq_num_init;
+			while (seq_num_now == seq_num_init) {
+				delay(ping_clk_server);
+				counter--;
+				pthread_mutex_lock(&mutex_session);
+				seq_num_now = q4s_session.seq_num_server;
+				pthread_mutex_unlock(&mutex_session);
+				if (counter <= 0) {
+					pthread_mutex_unlock(&mutex_print);
+					flags |= FLAG_FINISH_PING;
 					pthread_mutex_unlock(&mutex_flags);
+					break;
 				}
 			}
-			// When the interval bwidth_clk has finished, delivery is completed
-			// Now we update the value of bandwidth measured and send a last Q4S BWIDTH
-			if (ms_delayed == bwidth_clk) {
-				pthread_mutex_lock(&mutex_session);
-				(&q4s_session)->bw_measure_client = (num_bwidth_received * 8000 / bwidth_clk);
-        pthread_mutex_unlock(&mutex_session);
-				num_bwidth_received = 0;
-				pthread_mutex_lock(&mutex_flags);
-				flags |= FLAG_TEMP_BWIDTH;
-				pthread_mutex_unlock(&mutex_flags);
+			if (counter <= 0) {
+				end_measure_timeout_activated = false;
 				break;
 			}
-			// Delays 1 ms
-			delay(ms_per_message[0]);
-			ms_delayed++;
+			if (cancel_timer_end_measure) {
+				break;
+			}
+		}
+	} else if (stage == 1) {
+			int bwidth_clk;
+			int interval_wait;
+			int num_packet_received;
+			while(1) {
+				pthread_mutex_lock(&mutex_session);
+				bwidth_clk = max(q4s_session.bwidth_clk, 2000);
+				num_packet_received = num_bwidth_received;
+				delivery_server_finished = (((&q4s_session)->bw_th[1] <= 0 ||
+					(&q4s_session)->bw_measure_client >= (&q4s_session)->bw_th[1])
+					&& ((&q4s_session)->packetloss_th[1] <= 0 ||
+					(&q4s_session)->packetloss_measure_client <= (&q4s_session)->packetloss_th[1]));
+				pthread_mutex_unlock(&mutex_session);
+				// bwidth_clk is the timeout, restarted when a Q4S BWIDTH is received
+				counter = 10;
+				interval_wait = bwidth_clk/counter;
+				while (num_packet_received == 0 && delivery_server_finished) {
+					delay(interval_wait);
+					counter--;
+					pthread_mutex_lock(&mutex_session);
+					num_packet_received = num_bwidth_received;
+					delivery_server_finished = (((&q4s_session)->bw_th[1] <= 0 ||
+						(&q4s_session)->bw_measure_client >= (&q4s_session)->bw_th[1])
+						&& ((&q4s_session)->packetloss_th[1] <= 0 ||
+						(&q4s_session)->packetloss_measure_client <= (&q4s_session)->packetloss_th[1]));
+					pthread_mutex_unlock(&mutex_session);
+					if (counter <= 0) {
+						pthread_mutex_unlock(&mutex_print);
+						flags |= FLAG_FINISH_BWIDTH;
+						pthread_mutex_unlock(&mutex_flags);
+						break;
+					}
+				}
+				if (counter <= 0) {
+					end_measure_timeout_activated = false;
+					break;
+				}
+				if (cancel_timer_end_measure) {
+					break;
+				}
+			}
+	}
+}
+
+// Activates a flag when ping timeout has occurred in Stage 2
+void *ping_timeout_2() {
+	int ping_clk;
+	while(1) {
+		pthread_mutex_lock(&mutex_session);
+		ping_clk = q4s_session.ping_clk_continuity;
+		pthread_mutex_unlock(&mutex_session);
+
+    delay(ping_clk);
+
+		pthread_mutex_lock(&mutex_flags);
+		flags |= FLAG_TEMP_PING_2;
+		pthread_mutex_unlock(&mutex_flags);
+
+		if (cancel_timer_ping_2) {
+			break;
+		}
+	}
+}
+
+// Manages timeout of alert pause
+void *alert_pause_timeout() {
+	int pause_interval = q4s_session.alert_pause;
+	pthread_mutex_lock(&mutex_session);
+	q4s_session.alert_pause_activated = true;
+	pthread_mutex_unlock(&mutex_session);
+
+  delay(pause_interval);
+
+	pthread_mutex_lock(&mutex_session);
+	q4s_session.alert_pause_activated = false;
+	pthread_mutex_unlock(&mutex_session);
+
+}
+
+// Manages timeout of bandwidth reception
+void *bwidth_reception_timeout() {
+
+	pthread_mutex_lock(&mutex_session);
+	bwidth_reception_timeout_activated = true;
+	int bwidth_clk = q4s_session.bwidth_clk; // time established for BWIDTH measure
+	pthread_mutex_unlock(&mutex_session);
+
+	delay(bwidth_clk);
+
+	pthread_mutex_lock(&mutex_flags);
+	flags |= FLAG_MEASURE_BWIDTH;
+	pthread_mutex_unlock(&mutex_flags);
+}
+
+// Sends a Q4S BWIDTH burst and activates a flag when finished
+void *bwidth_delivery() {
+  int bwidth_clk; // time established for BWIDTH delivery
+	int num_messages_to_send; // total number of messages to send in the burst
+	int num_messages_sent; // number of messages sent in this burst
+	int messages_per_ms; // BWIDTH messages to send each 1 ms
+	int ms_per_message[11]; // intervals of ms for sending BWIDTH messages
+	memset(ms_per_message, 0, sizeof(ms_per_message));
+	int ms_iterated; // theoric ms passed
+	int result; // auxiliary variable for error detection in timespec
+	int elapsed_time; // variable used to adjust elapsed time
+	int us_to_subtract; // ms accumulated to substract
+	int us_passed_total;
+	int delay_time;  // time to delay
+
+	// Initializes parameters needed
+	ms_iterated = 0;
+	delay_time = 1000;
+	pthread_mutex_lock(&mutex_session);
+	num_messages_to_send = ceil((float) ((&q4s_session)->bw_th[0] * (&q4s_session)->bwidth_clk) / (float) (MESSAGE_BWIDTH_SIZE * 8));
+	num_messages_sent = 0;
+	q4s_session.seq_num_client = 0;
+	bwidth_clk = q4s_session.bwidth_clk;
+	messages_per_ms = q4s_session.bwidth_messages_per_ms;
+	ms_per_message[0] = q4s_session.ms_per_bwidth_message[0];
+	for (int i = 1; i < sizeof(ms_per_message); i++) {
+		if (q4s_session.ms_per_bwidth_message[i] > 0) {
+			ms_per_message[i] = q4s_session.ms_per_bwidth_message[i];
+		} else {
+			break;
+		}
+	}
+	pthread_mutex_unlock(&mutex_session);
+
+	// Start of Q4S BWIDTH delivery
+	while(1) {
+		if (ms_iterated == 0) {
+			result = clock_gettime(CLOCK_REALTIME, &tm1_adjust);
+		  if (result < 0) {
+				pthread_mutex_lock(&mutex_print);
+		    printf("Error in clock_gettime(): %s\n", strerror(errno));
+				pthread_mutex_unlock(&mutex_print);
+		  }
+			result = clock_gettime(CLOCK_REALTIME, &tm1_jitter);
+		  if (result < 0) {
+				pthread_mutex_lock(&mutex_print);
+		    printf("Error in clock_gettime(): %s\n", strerror(errno));
+				pthread_mutex_unlock(&mutex_print);
+		  }
+		}
+		// Sends a number specified of 1kB BWIDTH messages per 1 ms
+		int j = 0;
+		while (j < messages_per_ms) {
+			pthread_mutex_lock(&mutex_session);
+			// Fills q4s_session.message_to_send with the Q4S BWIDTH parameters
+			create_bwidth(&q4s_session.message_to_send);
+			// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
+			prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
+			// Sends the prepared message
+			send_message_UDP(q4s_session.prepared_message);
+			(&q4s_session)->seq_num_client++;
+			num_messages_sent++;
+			pthread_mutex_unlock(&mutex_session);
+			j++;
+		}
+		// Sends (when appropiate) 1 or more extra BWIDTH message(s) of 1kB
+		for (int k = 1; k < sizeof(ms_per_message); k++) {
+			if (ms_per_message[k] > 0 && ms_iterated % ms_per_message[k] == 0) {
+				pthread_mutex_lock(&mutex_session);
+				// Fills q4s_session.message_to_send with the Q4S BWIDTH parameters
+				create_bwidth(&q4s_session.message_to_send);
+				// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
+				prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
+				// Sends the prepared message
+				send_message_UDP(q4s_session.prepared_message);
+				(&q4s_session)->seq_num_client++;
+				num_messages_sent++;
+				pthread_mutex_unlock(&mutex_session);
+			} else if (ms_per_message[k] == 0) {
+				break;
+			}
+		}
+		// When the interval bwidth_clk has finished, delivery is completed
+		if (ms_iterated >= bwidth_clk || num_messages_sent >= num_messages_to_send) {
+			result = clock_gettime(CLOCK_REALTIME, &tm2_jitter);
+		  if (result < 0) {
+				pthread_mutex_lock(&mutex_print);
+		    printf("Error in clock_gettime(): %s\n", strerror(errno));
+				pthread_mutex_unlock(&mutex_print);
+		  }
+
+			elapsed_time = ms_elapsed(tm1_jitter, tm2_jitter);
+
+			delay(2000);
+
+			pthread_mutex_lock(&mutex_flags);
+			flags |= FLAG_BWIDTH_BURST_SENT;
+			pthread_mutex_unlock(&mutex_flags);
+			break;
+		}
+
+		udelay(delay_time);
+
+		ms_iterated++;
+
+		result = clock_gettime(CLOCK_REALTIME, &tm2_adjust);
+	  if (result < 0) {
+			pthread_mutex_lock(&mutex_print);
+	    printf("Error in clock_gettime(): %s\n", strerror(errno));
+			pthread_mutex_unlock(&mutex_print);
+	  }
+
+		elapsed_time = us_elapsed(tm1_adjust, tm2_adjust);
+
+		result = clock_gettime(CLOCK_REALTIME, &tm1_adjust);
+		if (result < 0) {
+			pthread_mutex_lock(&mutex_print);
+			printf("Error in clock_gettime(): %s\n", strerror(errno));
+			pthread_mutex_unlock(&mutex_print);
+		}
+		us_passed_total += elapsed_time;
+
+		if (elapsed_time - delay_time > 0) {
+			us_to_subtract += elapsed_time - delay_time;
+		}
+		delay_time = 1000 - min(us_to_subtract, 1000);
+		us_to_subtract -= 1000 - delay_time;
+	}
+}
+
+// Function exploring the keyboard
+// Thread function for keystrokes detection and interpretation
+void *thread_explores_keyboard () {
+	int pressed_key;
+	while(1) {
+		// Pauses program execution for 10 ms
+		delay(10);
+		// Checks if a key has been pressed
+		if(kbhit()) {
+			// Stores pressed key
+			pressed_key = kbread();
+			switch(pressed_key) {
+				// If "b" (of "Q4S BEGIN") has been pressed, FLAG_CONNECT is activated
+				case 'b':
+				  // Lock to guarantee mutual exclusion
+					pthread_mutex_lock(&mutex_flags);
+					flags |= FLAG_CONNECT;
+					pthread_mutex_unlock(&mutex_flags);
+					break;
+				// If "c" (of "cancel") has been pressed, FLAG_CANCEL is activated
+        case 'c':
+          // Lock to guarantee mutual exclusion
+          pthread_mutex_lock(&mutex_flags);
+          flags |= FLAG_CANCEL;
+          pthread_mutex_unlock(&mutex_flags);
+          break;
+        // If any other key has been pressed, nothing happens
+				default:
+					break;
+			}
 		}
 	}
 }
 
 
+//--------------------------------------------------------
 // CHECK FUNCTIONS OF STATE MACHINE
+//--------------------------------------------------------
 
 // Checks if client wants to connect server
 int check_connect (fsm_t* this) {
@@ -1968,12 +2682,32 @@ int check_go_to_1 (fsm_t* this) {
 	return result;
 }
 
-// Checks if ping timeout has occurred
+// Checks if client wants to go to Stage 2
+int check_go_to_2 (fsm_t* this) {
+	int result;
+	// Lock to guarantee mutual exclusion
+	pthread_mutex_lock(&mutex_flags);
+	result = (flags & FLAG_GO_TO_2);
+  pthread_mutex_unlock(&mutex_flags);
+	return result;
+}
+
+// Checks if ping timeout has occurred in Stage 0
 int check_temp_ping_0 (fsm_t* this) {
 	int result;
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
 	result = (flags & FLAG_TEMP_PING_0);
+  pthread_mutex_unlock(&mutex_flags);
+	return result;
+}
+
+// Checks if ping timeout has occurred in Stage 2
+int check_temp_ping_2 (fsm_t* this) {
+	int result;
+	// Lock to guarantee mutual exclusion
+	pthread_mutex_lock(&mutex_flags);
+	result = (flags & FLAG_TEMP_PING_2);
   pthread_mutex_unlock(&mutex_flags);
 	return result;
 }
@@ -1998,22 +2732,32 @@ int check_finish_ping (fsm_t* this) {
 	return result;
 }
 
-// Checks if bwidth timeout has occurred
-int check_temp_bwidth (fsm_t* this) {
+// Checks if client has sent a Q4S BWIDTH burst
+int check_bwidth_burst_sent (fsm_t* this) {
 	int result;
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
-	result = (flags & FLAG_TEMP_BWIDTH);
+	result = (flags & FLAG_BWIDTH_BURST_SENT);
   pthread_mutex_unlock(&mutex_flags);
 	return result;
 }
 
-// Checks if q4s client has received a Q4S BWIDTH from server
+// Checks if q4s client has received a Q4S BWIDTH
 int check_receive_bwidth (fsm_t* this) {
 	int result;
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
 	result = (flags & FLAG_RECEIVE_BWIDTH);
+  pthread_mutex_unlock(&mutex_flags);
+	return result;
+}
+
+// Checks if q4s client has to measure bwidth
+int check_measure_bwidth (fsm_t* this) {
+	int result;
+	// Lock to guarantee mutual exclusion
+	pthread_mutex_lock(&mutex_flags);
+	result = (flags & FLAG_MEASURE_BWIDTH);
   pthread_mutex_unlock(&mutex_flags);
 	return result;
 }
@@ -2048,8 +2792,9 @@ int check_receive_cancel (fsm_t* this) {
 	return result;
 }
 
-
+//-------------------------------------------------------------
 // ACTION FUNCTIONS OF STATE MACHINE
+//------------------------------------------------------------
 
 // Prepares for Q4S session
 void Setup (fsm_t* fsm) {
@@ -2068,9 +2813,11 @@ void Setup (fsm_t* fsm) {
 		// Initialize auxiliary variables
 		num_packet_lost = 0;
 		num_ping = 0;
+		num_failures = 0;
 		// Initialize session variables
 		pthread_mutex_lock(&mutex_session);
 	  q4s_session.session_id = -1;
+		q4s_session.stage = -1;
 		q4s_session.seq_num_server = -1;
 		q4s_session.seq_num_client = 0;
 		q4s_session.qos_level[0] = -1;
@@ -2083,14 +2830,25 @@ void Setup (fsm_t* fsm) {
 		q4s_session.bw_th[1] = -1;
 		q4s_session.packetloss_th[0] = -1;
 		q4s_session.packetloss_th[1] = -1;
+		q4s_session.jitter_measure_server = -1;
+		q4s_session.jitter_measure_client = -1;
+		q4s_session.packetloss_measure_server = -1;
 		q4s_session.packetloss_measure_client = -1;
+		q4s_session.bw_measure_server = -1;
+		q4s_session.bw_measure_client = -1;
 		pthread_mutex_unlock(&mutex_session);
 
 		pthread_mutex_lock(&mutex_print);
-		printf("\nPress 'b' to send a Q4S BEGIN\n");
-		pthread_mutex_unlock(&mutex_print);
+		printf("\nWhenever you want to send a Q4S CANCEL, press 'c'\n");
+	  pthread_mutex_unlock(&mutex_print);
+
 		// Throws a thread to check the arrival of Q4S messages using TCP
+		cancel_TCP_thread = false;
 		pthread_create(&receive_TCP_thread, NULL, (void*)thread_receives_TCP, NULL);
+
+		pthread_mutex_lock(&mutex_flags);
+		flags |= FLAG_BEGIN;
+		pthread_mutex_unlock(&mutex_flags);
 	}
 }
 
@@ -2101,6 +2859,9 @@ void Begin (fsm_t* fsm) {
   flags &= ~FLAG_BEGIN;
   pthread_mutex_unlock(&mutex_flags);
 
+	pthread_mutex_lock(&mutex_print);
+	printf("\nCreating a Q4S BEGIN\n");
+	pthread_mutex_unlock(&mutex_print);
 
 	pthread_mutex_lock(&mutex_session);
 	// Fills q4s_session.message_to_send with the Q4S BEGIN parameters
@@ -2110,6 +2871,10 @@ void Begin (fsm_t* fsm) {
 	// Sends the prepared message
   send_message_TCP(q4s_session.prepared_message);
 	pthread_mutex_unlock(&mutex_session);
+
+	pthread_mutex_lock(&mutex_print);
+	printf("\nI have sent a Q4S BEGIN!\n");
+	pthread_mutex_unlock(&mutex_print);
 }
 
 // Stores parameters received in the first 200 OK message from server
@@ -2122,6 +2887,14 @@ void Store (fsm_t* fsm) {
 	// Stores parameters of message received
 	pthread_mutex_lock(&mutex_session);
   store_parameters(&q4s_session, &(q4s_session.message_received));
+
+	pthread_mutex_lock(&mutex_print);
+	printf("\nQ4S session has been established\n");
+	pthread_mutex_unlock(&mutex_print);
+
+	// Throws a thread to check the arrival of Q4S messages using UDP
+	cancel_UDP_thread = false;
+	pthread_create(&receive_UDP_thread, NULL, (void*)thread_receives_UDP, NULL);
 
 	// If there are latency or jitter thresholds established
 	if ((&q4s_session)->latency_th > 0 || (&q4s_session)->jitter_th[0] > 0
@@ -2177,6 +2950,7 @@ void Ready0 (fsm_t* fsm) {
   pthread_mutex_unlock(&mutex_flags);
 
   pthread_mutex_lock(&mutex_session);
+	q4s_session.stage = 0;
 	// Fills q4s_session.message_to_send with the Q4S READY 0 parameters
 	create_ready0(&q4s_session.message_to_send);
   // Converts q4s_session.message_to_send into a message with correct format (prepared_message)
@@ -2195,8 +2969,27 @@ void Ready1 (fsm_t* fsm) {
 
 
 	pthread_mutex_lock(&mutex_session);
+	q4s_session.stage = 1;
   // Fills q4s_session.message_to_send with the Q4S READY 1 parameters
 	create_ready1(&q4s_session.message_to_send);
+	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
+	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
+	// Sends the prepared message
+	send_message_TCP(q4s_session.prepared_message);
+	pthread_mutex_unlock(&mutex_session);
+}
+
+// Creates and sends a Q4S READY 2 message to the server
+void Ready2 (fsm_t* fsm) {
+	// Lock to guarantee mutual exclusion
+	pthread_mutex_lock(&mutex_flags);
+  flags &= ~FLAG_GO_TO_2;
+  pthread_mutex_unlock(&mutex_flags);
+
+	pthread_mutex_lock(&mutex_session);
+	q4s_session.stage = 2;
+  // Fills q4s_session.message_to_send with the Q4S READY 1 parameters
+	create_ready2(&q4s_session.message_to_send);
 	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
 	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
 	// Sends the prepared message
@@ -2218,18 +3011,10 @@ void Ping_Init (fsm_t* fsm) {
 	store_parameters(&q4s_session, &(q4s_session.message_received));
 	pthread_mutex_unlock(&mutex_session);
 
-	// Throws a thread to check the arrival of Q4S messages using UDP
-	pthread_create(&receive_UDP_thread, NULL, (void*)thread_receives_UDP, NULL);
-
 	// Initialize auxiliary variables
 	num_packet_lost = 0;
 	num_ping = 0;
-	num_latency_measures_client = 0;
-	num_jitter_measures_client = 0;
-	num_packetloss_measures_client = 0;
-	num_latency_measures_server = 0;
-	num_jitter_measures_server = 0;
-	num_packetloss_measures_server = 0;
+	num_packet_since_alert = 0;
 	num_bwidth_received = 0;
 
   pthread_mutex_lock(&mutex_tm_latency);
@@ -2245,33 +3030,54 @@ void Ping_Init (fsm_t* fsm) {
 	q4s_session.seq_num_server = -1;
 	q4s_session.seq_num_client = 0;
 	q4s_session.packetloss_measure_client = -1;
+	q4s_session.packetloss_measure_server = -1;
+	q4s_session.latency_measure_server = 0;
+	q4s_session.latency_measure_client = 0;
+	q4s_session.jitter_measure_server = -1;
+	q4s_session.jitter_measure_client = -1;
 	memset((&q4s_session)->latency_samples, 0, MAXNUMSAMPLES);
+	memset((&q4s_session)->latency_window, 0, MAXNUMSAMPLES);
+	pos_latency = 0;
 	memset((&q4s_session)->elapsed_time_samples, 0, MAXNUMSAMPLES);
+	memset((&q4s_session)->elapsed_time_window, 0, MAXNUMSAMPLES);
+	pos_elapsed_time = 0;
 	memset((&q4s_session)->packetloss_samples, 0, MAXNUMSAMPLES);
-	memset((&q4s_session)->bw_samples, 0, MAXNUMSAMPLES);
+	memset((&q4s_session)->packetloss_window, 0, MAXNUMSAMPLES);
+	pos_packetloss = 0;
 	// Fills q4s_session.message_to_send with the Q4S PING parameters
 	create_ping(&q4s_session.message_to_send);
 	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
 	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
 	// Sends the prepared message
 	send_message_UDP(q4s_session.prepared_message);
+	num_packet_since_alert++;
 
 	// Initialize ping period if necessary
-	if (q4s_session.ping_clk_negotiation <= 0) {
-		q4s_session.ping_clk_negotiation = 200;
+	if (q4s_session.ping_clk_negotiation_client <= 0) {
+		q4s_session.ping_clk_negotiation_client = 200;
 	}
 	// Initialize ping period if necessary
 	if (q4s_session.ping_clk_continuity <= 0) {
 		q4s_session.ping_clk_continuity = 200;
 	}
+	int stage = q4s_session.stage;
 	pthread_mutex_unlock(&mutex_session);
-	// Starts timer for ping delivery
-	pthread_create(&timer_ping, NULL, (void*)ping_timeout, NULL);
 
-  // Simulates 1 packet loss
-	pthread_mutex_lock(&mutex_session);
-  (&q4s_session)->seq_num_client++;
-	pthread_mutex_unlock(&mutex_session);
+  if (stage == 2) {
+		pthread_mutex_lock(&mutex_session);
+		printf("\nStage 2 has started: Q4S PING exchange while application execution\n");
+		pthread_mutex_unlock(&mutex_session);
+		// Starts timer for ping delivery in Stage 2
+		cancel_timer_ping_2 = false;
+		pthread_create(&timer_ping_2, NULL, (void*)ping_timeout_2, NULL);
+	} else {
+		pthread_mutex_lock(&mutex_session);
+		printf("\nStage 0 has started: Q4S PING exchange\n");
+		pthread_mutex_unlock(&mutex_session);
+		// Starts timer for ping delivery in Stage 0
+		cancel_timer_ping_0 = false;
+		pthread_create(&timer_ping_0, NULL, (void*)ping_timeout_0, NULL);
+	}
 }
 
 // Sends a Q4S PING message
@@ -2279,16 +3085,21 @@ void Ping (fsm_t* fsm) {
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
   flags &= ~FLAG_TEMP_PING_0;
+	flags &= ~FLAG_TEMP_PING_2;
   pthread_mutex_unlock(&mutex_flags);
 
 	pthread_mutex_lock(&mutex_session);
   (&q4s_session)->seq_num_client++;
+  if ((&q4s_session)->seq_num_client >= MAXNUMSAMPLES - 1) {
+		(&q4s_session)->seq_num_client = 0;
+	}
 	// Fills q4s_session.message_to_send with the Q4S PING parameters
 	create_ping(&q4s_session.message_to_send);
 	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
 	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
 	// Sends the prepared message
 	send_message_UDP(q4s_session.prepared_message);
+	num_packet_since_alert++;
 	pthread_mutex_unlock(&mutex_session);
 }
 
@@ -2313,20 +3124,12 @@ void Update (fsm_t* fsm) {
 			if (num_ping % 2 == 0 && num_ping > 0) {
 				elapsed_time = ms_elapsed(tm1_jitter, tm2_jitter);
 
-				pthread_mutex_lock(&mutex_print);
-				printf("Elapsed time stored: %d\n", elapsed_time);
-				pthread_mutex_unlock(&mutex_print);
-
 	      pthread_mutex_lock(&mutex_session);
 				update_jitter(&q4s_session, elapsed_time);
 				pthread_mutex_unlock(&mutex_session);
 
 			} else if (num_ping % 2 != 0 && num_ping > 1) {
 				elapsed_time = ms_elapsed(tm2_jitter, tm1_jitter);
-
-				pthread_mutex_lock(&mutex_print);
-				printf("Elapsed time stored: %d\n",elapsed_time);
-				pthread_mutex_unlock(&mutex_print);
 
 				pthread_mutex_lock(&mutex_session);
 				update_jitter(&q4s_session, elapsed_time);
@@ -2339,47 +3142,67 @@ void Update (fsm_t* fsm) {
 
 		pthread_mutex_lock(&mutex_session);
 		if ((&q4s_session)->jitter_th[0] > 0 && (&q4s_session)->jitter_measure_server > (&q4s_session)->jitter_th[0]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Upstream jitter exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_jitter_measures_server = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Upstream jitter exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		} else if ((&q4s_session)->jitter_th[1] > 0 && (&q4s_session)->jitter_measure_client > (&q4s_session)->jitter_th[1]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Downstream jitter exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_jitter_measures_client = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Downstream jitter exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				memset((&q4s_session)->elapsed_time_samples, 0, MAXNUMSAMPLES);
+				memset((&q4s_session)->elapsed_time_window, 0, MAXNUMSAMPLES);
+				pos_elapsed_time = 0;
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		}
 		pthread_mutex_unlock(&mutex_session);
 
     pthread_mutex_lock(&mutex_session);
 		if ((&q4s_session)->packetloss_th[1] > 0) {
-			if (num_losses > 0) {
-				pthread_mutex_lock(&mutex_print);
-				printf("\nLoss of %d Q4S PING(s) detected\n", num_losses);
-				pthread_mutex_unlock(&mutex_print);
-			}
 			update_packetloss(&q4s_session, num_losses);
-			num_packetloss_measures_client++;
 		}
 		pthread_mutex_unlock(&mutex_session);
 
     pthread_mutex_lock(&mutex_session);
 		if ((&q4s_session)->packetloss_th[0] > 0 && (&q4s_session)->packetloss_measure_server > (&q4s_session)->packetloss_th[0]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Upstream packetloss exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_packetloss_measures_server = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Upstream packetloss exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		} else if ((&q4s_session)->packetloss_th[1] > 0 && (&q4s_session)->packetloss_measure_client > (&q4s_session)->packetloss_th[1]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Downstream packetloss exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_packetloss_measures_client = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Downstream packetloss exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				memset((&q4s_session)->packetloss_samples, 0, MAXNUMSAMPLES);
+				memset((&q4s_session)->packetloss_window, 0, MAXNUMSAMPLES);
+				pos_packetloss = 0;
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		}
 		pthread_mutex_unlock(&mutex_session);
 
 
     pthread_mutex_lock(&mutex_session);
-		// Fills q4s_session.message_to_send with the Q4S PING parameters
+		// Fills q4s_session.message_to_send with the Q4S 200 parameters
 		create_200(&q4s_session.message_to_send);
 		// Converts q4s_session.message_to_send into a message with correct format (prepared_message
 		prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
@@ -2399,51 +3222,27 @@ void Update (fsm_t* fsm) {
 			if ((&tm_latency_start1)->seq_number == (&tm_latency_end)->seq_number) {
 				int rtt = ms_elapsed((&tm_latency_start1)->tm, (&tm_latency_end)->tm);
 
-				pthread_mutex_lock(&mutex_print);
-				printf("\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
-				pthread_mutex_unlock(&mutex_print);
-
 				pthread_mutex_lock(&mutex_session);
 				update_latency(&q4s_session, rtt/2);
 				pthread_mutex_unlock(&mutex_session);
-
-				num_latency_measures_client++;
 			} else if ((&tm_latency_start2)->seq_number == (&tm_latency_end)->seq_number) {
 				int rtt = ms_elapsed((&tm_latency_start2)->tm, (&tm_latency_end)->tm);
 
-				pthread_mutex_lock(&mutex_print);
-				printf("\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
-				pthread_mutex_unlock(&mutex_print);
-
 				pthread_mutex_lock(&mutex_session);
 				update_latency(&q4s_session, rtt/2);
 				pthread_mutex_unlock(&mutex_session);
-
-				num_latency_measures_client++;
 			} else if ((&tm_latency_start3)->seq_number == (&tm_latency_end)->seq_number) {
 				int rtt = ms_elapsed((&tm_latency_start3)->tm, (&tm_latency_end)->tm);
 
-				pthread_mutex_lock(&mutex_print);
-				printf("\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
-				pthread_mutex_unlock(&mutex_print);
-
 				pthread_mutex_lock(&mutex_session);
 				update_latency(&q4s_session, rtt/2);
 				pthread_mutex_unlock(&mutex_session);
-
-				num_latency_measures_client++;
 			} else if ((&tm_latency_start4)->seq_number == (&tm_latency_end)->seq_number) {
 				int rtt = ms_elapsed((&tm_latency_start4)->tm, (&tm_latency_end)->tm);
 
-				pthread_mutex_lock(&mutex_print);
-				printf("\nRTT is: %d ms, and latency is: %d ms\n", rtt, rtt/2);
-				pthread_mutex_unlock(&mutex_print);
-
 				pthread_mutex_lock(&mutex_session);
 				update_latency(&q4s_session, rtt/2);
 				pthread_mutex_unlock(&mutex_session);
-
-				num_latency_measures_client++;
 			}
 			pthread_mutex_unlock(&mutex_tm_latency);
 		} else {
@@ -2452,15 +3251,28 @@ void Update (fsm_t* fsm) {
 
 		pthread_mutex_lock(&mutex_session);
 		if ((&q4s_session)->latency_th > 0 && (&q4s_session)->latency_measure_server > (&q4s_session)->latency_th) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Latency measured by server exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_latency_measures_server = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Latency measured by server exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		} else if ((&q4s_session)->latency_th > 0 && (&q4s_session)->latency_measure_client > (&q4s_session)->latency_th) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Latency measured by client exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_latency_measures_client = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Latency measured by client exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				memset((&q4s_session)->latency_samples, 0, MAXNUMSAMPLES);
+				memset((&q4s_session)->latency_window, 0, MAXNUMSAMPLES);
+				pos_latency = 0;
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		}
 		pthread_mutex_unlock(&mutex_session);
 
@@ -2475,43 +3287,77 @@ void Update (fsm_t* fsm) {
 
 		pthread_mutex_lock(&mutex_session);
 		if ((&q4s_session)->packetloss_th[1] > 0) {
-			if (num_losses > 0) {
-				pthread_mutex_lock(&mutex_print);
-				printf("\nLoss of %d Q4S BWIDTH(s) detected\n", num_losses);
-				pthread_mutex_unlock(&mutex_print);
-			}
 			update_packetloss(&q4s_session, num_losses);
-			num_packetloss_measures_client++;
 		}
 		pthread_mutex_unlock(&mutex_session);
+	} else if (flags & FLAG_MEASURE_BWIDTH) {
+	  flags &= ~FLAG_MEASURE_BWIDTH;
+		pthread_mutex_unlock(&mutex_flags);
 
-    pthread_mutex_lock(&mutex_session);
+		pthread_mutex_lock(&mutex_session);
+		(&q4s_session)->bw_measure_client = (num_bwidth_received * (MESSAGE_BWIDTH_SIZE * 8) / (&q4s_session)->bwidth_clk);
+		int bw_measure_client = (&q4s_session)->bw_measure_client;
+		num_bwidth_received = 0;
+		bwidth_reception_timeout_activated = false;
+		pthread_mutex_unlock(&mutex_session);
+
+		pthread_mutex_lock(&mutex_session);
+		if ((&q4s_session)->bw_th[0] > 0 && (&q4s_session)->bw_measure_server >= 0
+		  && (&q4s_session)->bw_measure_server < (&q4s_session)->bw_th[0]) {
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Upstream bandwidth doesn't reach the threshold: %d [%d]\n", (&q4s_session)->bw_th[0], (&q4s_session)->bw_measure_server);
+				pthread_mutex_unlock(&mutex_print);
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
+		} else if ((&q4s_session)->bw_th[1] > 0 && (&q4s_session)->bw_measure_client >= 0
+		  && (&q4s_session)->bw_measure_client < (&q4s_session)->bw_th[1]) {
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Downstream bandwidth doesn't reach the threshold: %d [%d]\n", (&q4s_session)->bw_th[1], (&q4s_session)->bw_measure_client);
+				pthread_mutex_unlock(&mutex_print);
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
+		}
+
 		if ((&q4s_session)->packetloss_th[0] > 0 && (&q4s_session)->packetloss_measure_server > (&q4s_session)->packetloss_th[0]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Upstream packetloss exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_packetloss_measures_server = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Upstream packetloss exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		} else if ((&q4s_session)->packetloss_th[1] > 0 && (&q4s_session)->packetloss_measure_client > (&q4s_session)->packetloss_th[1]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Downstream packetloss exceeds the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_packetloss_measures_client = 0;
+			num_packet_since_alert = 0;
+			if ((&q4s_session)->alert_pause_activated == false) {
+				pthread_mutex_lock(&mutex_print);
+				printf("Downstream packetloss exceeds the threshold\n");
+				pthread_mutex_unlock(&mutex_print);
+				memset((&q4s_session)->packetloss_samples, 0, MAXNUMSAMPLES);
+				memset((&q4s_session)->packetloss_window, 0, MAXNUMSAMPLES);
+				pos_packetloss = 0;
+				// Starts timer for alert pause
+				cancel_timer_alert = false;
+				pthread_create(&timer_alert, NULL, (void*)alert_pause_timeout, NULL);
+			}
 		}
 		pthread_mutex_unlock(&mutex_session);
 
 		pthread_mutex_lock(&mutex_session);
-		if ((&q4s_session)->bw_th[0] > 0 && (&q4s_session)->bw_measure_server > 0
-		  && (&q4s_session)->bw_measure_server < (&q4s_session)->bw_th[0]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Upstream bandwidth doesn't reach the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-			num_bwidth_received = 0;
-		} else if ((&q4s_session)->bw_th[1] > 0 && (&q4s_session)->bw_measure_client > 0
-		  && (&q4s_session)->bw_measure_client < (&q4s_session)->bw_th[1]) {
-			pthread_mutex_lock(&mutex_print);
-			printf("Downstream bandwidth doesn't reach the threshold\n");
-			pthread_mutex_unlock(&mutex_print);
-		}
+		// Fills q4s_session.message_to_send with the Q4S BWIDTH parameters
+		create_bwidth(&q4s_session.message_to_send);
+		// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
+		prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
+		// Sends the prepared message
+		send_message_UDP(q4s_session.prepared_message);
+		(&q4s_session)->seq_num_client++;
 		pthread_mutex_unlock(&mutex_session);
 
 	} else {
@@ -2519,46 +3365,24 @@ void Update (fsm_t* fsm) {
 	}
 
   pthread_mutex_lock(&mutex_session);
-	bool stage_0_finished = ((&q4s_session)->latency_th <= 0 ||
-	  (num_latency_measures_client >= NUMSAMPLESTOSUCCEED + 1 && num_latency_measures_server >= NUMSAMPLESTOSUCCEED))
-		&& ((&q4s_session)->jitter_th[0] <= 0 || num_jitter_measures_server >= NUMSAMPLESTOSUCCEED)
-		&& ((&q4s_session)->jitter_th[1] <= 0 || num_jitter_measures_client >= NUMSAMPLESTOSUCCEED + 1)
-		&& ((&q4s_session)->packetloss_th[0] <= 0 || num_packetloss_measures_server >= NUMSAMPLESTOSUCCEED)
-		&& ((&q4s_session)->packetloss_th[1] <= 0 || num_packetloss_measures_client >= NUMSAMPLESTOSUCCEED + 1);
-
-	bool no_stage_0 = (&q4s_session)->latency_th <= 0 && (&q4s_session)->jitter_th[0] <= 0
-	  && (&q4s_session)->jitter_th[1] <= 0;
+	int stage = q4s_session.stage;
 	pthread_mutex_unlock(&mutex_session);
 
-  pthread_mutex_lock(&mutex_flags);
-	if (stage_0_finished && !no_stage_0 && !(flags & FLAG_FINISH_PING)) {
-		pthread_cancel(timer_ping);
-		pthread_cancel(receive_UDP_thread);
-		pthread_mutex_lock(&mutex_print);
-		printf("\nStage 0 has finished succesfully\n");
-		pthread_mutex_unlock(&mutex_print);
-		flags |= FLAG_FINISH_PING;
-		pthread_mutex_unlock(&mutex_flags);
-	} else {
-		pthread_mutex_unlock(&mutex_flags);
-	}
+	if (stage == 0) {
+		pthread_mutex_lock(&mutex_session);
+		bool delivery_finished = num_packet_since_alert >= num_samples_succeed;
+		pthread_mutex_unlock(&mutex_session);
 
-	bool stage_1_finished = ((&q4s_session)->bw_th[0] <= 0 ||
-	  (&q4s_session)->bw_measure_server >= (&q4s_session)->bw_th[0])
-		&& ((&q4s_session)->bw_th[1] <= 0 || (&q4s_session)->bw_measure_client >= (&q4s_session)->bw_th[1])
-		&& ((&q4s_session)->packetloss_th[0] <= 0 || num_packetloss_measures_server > NUMSAMPLESTOSUCCEED)
-		&& ((&q4s_session)->packetloss_th[1] <= 0 || num_packetloss_measures_client > NUMSAMPLESTOSUCCEED + 1);
-
-	bool no_stage_1 = (&q4s_session)->bw_th[0] <= 0 && (&q4s_session)->bw_th[1] <= 0;
-	if (stage_1_finished && !no_stage_1 && !(flags & FLAG_FINISH_BWIDTH)) {
-		pthread_cancel(timer_bwidth);
-		pthread_cancel(receive_UDP_thread);
-		pthread_mutex_lock(&mutex_print);
-		printf("\nStage 1 has finished succesfully\n");
-		pthread_mutex_unlock(&mutex_print);
-		pthread_mutex_unlock(&mutex_print);
-		flags |= FLAG_FINISH_BWIDTH;
-		pthread_mutex_unlock(&mutex_flags);
+		if (delivery_finished && !end_measure_timeout_activated) {
+			cancel_timer_ping_0 = true;
+			pthread_mutex_lock(&mutex_print);
+			printf("\nFinished ping delivery from client\n");
+			printf("\nWaiting server to finish ping delivery\n");
+			pthread_mutex_unlock(&mutex_print);
+			// Starts timer for preventive wait at the end of measures
+			cancel_timer_end_measure = false;
+			pthread_create(&timer_end_measure, NULL, (void*)end_measure_timeout, NULL);
+		}
 	}
 }
 
@@ -2588,10 +3412,11 @@ void Decide (fsm_t* fsm) {
 			pthread_mutex_lock(&mutex_print);
 		  printf("\nThere are no thresholds established for bandwidth\n");
 			printf("\nNegotiation phase has finished\n");
-			printf("\nProceeding to send a Q4S CANCEL to the server\n");
+			printf("\nGoing to Stage 2 (measurements while application execution)\n");
 			pthread_mutex_unlock(&mutex_print);
+
 			pthread_mutex_lock(&mutex_flags);
-			flags |= FLAG_CANCEL;
+			flags |= FLAG_GO_TO_2;
 			pthread_mutex_unlock(&mutex_flags);
 	  }
 	} else if (flags & FLAG_FINISH_BWIDTH) {
@@ -2600,18 +3425,17 @@ void Decide (fsm_t* fsm) {
 		pthread_mutex_unlock(&mutex_flags);
 
 		pthread_mutex_lock(&mutex_print);
-		printf("\nStage 1 has finished succesfully\n");
 		printf("\nNegotiation phase has finished\n");
-		printf("\nProceeding to send a Q4S CANCEL to the server\n");
+		printf("\nGoing to Stage 2 (measurements while application execution)\n");
 		pthread_mutex_unlock(&mutex_print);
+
 		pthread_mutex_lock(&mutex_flags);
-		flags |= FLAG_CANCEL;
+		flags |= FLAG_GO_TO_2;
 		pthread_mutex_unlock(&mutex_flags);
 	}
-
 }
 
-// Sends a Q4S BWIDTH message and starts timer for BWIDTH delivery
+// Starts timer for BWIDTH delivery
 void Bwidth_Init (fsm_t* fsm) {
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
@@ -2623,55 +3447,72 @@ void Bwidth_Init (fsm_t* fsm) {
 	store_parameters(&q4s_session, &(q4s_session.message_received));
 	pthread_mutex_unlock(&mutex_session);
 
-	// Throws a thread to check the arrival of Q4S messages using UDP
-	pthread_create(&receive_UDP_thread, NULL, (void*)thread_receives_UDP, NULL);
-
 	// Initialize auxiliary variables
 	num_packet_lost = 0;
 	num_ping = 0;
-	num_latency_measures_client = 0;
-	num_jitter_measures_client = 0;
-	num_packetloss_measures_client = 0;
-	num_latency_measures_server = 0;
-	num_jitter_measures_server = 0;
-	num_packetloss_measures_server = 0;
+	num_packet_since_alert = 0;
 	num_bwidth_received = 0;
 
 	pthread_mutex_lock(&mutex_session);
 	// Initialize session variables
 	q4s_session.seq_num_server = -1;
 	q4s_session.seq_num_client = 0;
+	q4s_session.packetloss_measure_server = -1;
 	q4s_session.packetloss_measure_client = -1;
+	q4s_session.bw_measure_server = -1;
+	q4s_session.bw_measure_client = -1;
 	memset((&q4s_session)->latency_samples, 0, MAXNUMSAMPLES);
+	memset((&q4s_session)->latency_window, 0, MAXNUMSAMPLES);
+	pos_latency = 0;
 	memset((&q4s_session)->elapsed_time_samples, 0, MAXNUMSAMPLES);
+	memset((&q4s_session)->elapsed_time_window, 0, MAXNUMSAMPLES);
+	pos_elapsed_time = 0;
 	memset((&q4s_session)->packetloss_samples, 0, MAXNUMSAMPLES);
-	memset((&q4s_session)->bw_samples, 0, MAXNUMSAMPLES);
+	memset((&q4s_session)->packetloss_window, 0, MAXNUMSAMPLES);
+	pos_packetloss = 0;
 
 	// Initialize bwidth period if necessary
 	if (q4s_session.bwidth_clk <= 0) {
 		q4s_session.bwidth_clk = 1000;
 	}
 	pthread_mutex_unlock(&mutex_session);
-	// Starts timer for ping delivery
-	pthread_create(&timer_bwidth, NULL, (void*)bwidth_timeout, NULL);
+	pthread_mutex_lock(&mutex_session);
+	printf("\nStage 1 has started: Q4S BWIDTH exchange\n");
+	pthread_mutex_unlock(&mutex_session);
+	// Starts timer for bwidth delivery
+	cancel_timer_delivery_bwidth = false;
+	pthread_create(&timer_delivery_bwidth, NULL, (void*)bwidth_delivery, NULL);
 }
 
 // Sends a Q4S BWIDTH message
-void Bwidth (fsm_t* fsm) {
+void Bwidth_Decide (fsm_t* fsm) {
 	// Lock to guarantee mutual exclusion
 	pthread_mutex_lock(&mutex_flags);
-  flags &= ~FLAG_TEMP_BWIDTH;
+  flags &= ~FLAG_BWIDTH_BURST_SENT;
   pthread_mutex_unlock(&mutex_flags);
 
 	pthread_mutex_lock(&mutex_session);
-	// Fills q4s_session.message_to_send with the Q4S BWIDTH parameters
-	create_bwidth(&q4s_session.message_to_send);
-	// Converts q4s_session.message_to_send into a message with correct format (prepared_message)
-	prepare_message(&(q4s_session.message_to_send), q4s_session.prepared_message);
-	// Sends the prepared message
-	send_message_UDP(q4s_session.prepared_message);
-	(&q4s_session)->seq_num_client++;
+	int stage = q4s_session.stage;
+	bool delivery_finished = (((&q4s_session)->bw_th[0] <= 0 ||
+		(&q4s_session)->bw_measure_server >= (&q4s_session)->bw_th[0])
+		&& ((&q4s_session)->packetloss_th[0] <= 0 ||
+		(&q4s_session)->packetloss_measure_server <= (&q4s_session)->packetloss_th[0]));
 	pthread_mutex_unlock(&mutex_session);
+
+	if (stage == 1 && delivery_finished && !end_measure_timeout_activated) {
+		cancel_timer_delivery_bwidth = true;
+		pthread_mutex_lock(&mutex_print);
+		printf("\nFinished bwidth delivery from client\n");
+		printf("\nWaiting server to finish bwidth delivery\n");
+		pthread_mutex_unlock(&mutex_print);
+		// Starts timer for preventive wait at the end of measures
+		cancel_timer_end_measure = false;
+		pthread_create(&timer_end_measure, NULL, (void*)end_measure_timeout, NULL);
+	} else {
+		// Starts timer for bwidth delivery
+		cancel_timer_delivery_bwidth = false;
+		pthread_create(&timer_delivery_bwidth, NULL, (void*)bwidth_delivery, NULL);
+	}
 }
 
 // Creates and sends a Q4S CANCEL message to the server
@@ -2690,6 +3531,15 @@ void Cancel (fsm_t* fsm) {
 	// Sends the prepared message
 	send_message_TCP(q4s_session.prepared_message);
 	pthread_mutex_unlock(&mutex_session);
+	pthread_mutex_lock(&mutex_print);
+	printf("\nI have sent a Q4S CANCEL!\n");
+	pthread_mutex_unlock(&mutex_print);
+
+	// Cancels timers
+	cancel_timer_ping_0 = true;
+	cancel_timer_ping_2 = true;
+	cancel_timer_delivery_bwidth = true;
+	cancel_timer_reception_bwidth = true;
 }
 
 // Exits Q4S session
@@ -2699,65 +3549,18 @@ void Exit (fsm_t* fsm) {
 	// Puts every FLAG to 0
 	flags = 0;
 	pthread_mutex_unlock(&mutex_flags);
-  // Cancels timers
-	pthread_cancel(timer_ping);
-	pthread_cancel(timer_bwidth);
-  // Cancels the threads receiving Q4S messages
-	pthread_cancel(receive_TCP_thread);
-	pthread_cancel(receive_UDP_thread);
-	// Closes connection with Q4S server
-  close(socket_TCP);
-	close(socket_UDP);
+
+	finished = true;
+
 	pthread_mutex_lock(&mutex_print);
-	printf("\nConnection has been closed\n");
-	printf("Press 'q' to connect to the Q4S server\n");
+  printf("\nQ4S session finished\n");
 	pthread_mutex_unlock(&mutex_print);
 }
 
-
-// FUNCTION EXPLORING THE KEYBOARD
-
-// Thread function for keystrokes detection and interpretation
-void *thread_explores_keyboard () {
-	int pressed_key;
-	while(1) {
-		// Pauses program execution for 10 ms
-		delay(10);
-		// Checks if a key has been pressed
-		if(kbhit()) {
-			// Stores pressed key
-			pressed_key = kbread();
-			switch(pressed_key) {
-				// If "q" (of "q4s") has been pressed, FLAG_CONNECT is activated
-				case 'q':
-				  // Lock to guarantee mutual exclusion
-					pthread_mutex_lock(&mutex_flags);
-					flags |= FLAG_CONNECT;
-					pthread_mutex_unlock(&mutex_flags);
-					break;
-				// If "b" (of "begin") has been pressed, FLAG_BEGIN is activated
-				case 'b':
-				  // Lock to guarantee mutual exclusion
-					pthread_mutex_lock(&mutex_flags);
-					flags |= FLAG_BEGIN;
-					pthread_mutex_unlock(&mutex_flags);
-					break;
-				// If "c" (of "cancel") has been pressed, FLAG_CANCEL is activated
-        case 'c':
-          // Lock to guarantee mutual exclusion
-          pthread_mutex_lock(&mutex_flags);
-          flags |= FLAG_CANCEL;
-          pthread_mutex_unlock(&mutex_flags);
-          break;
-        // If any other key has been pressed, nothing happens
-				default:
-					break;
-			}
-		}
-	}
-}
-
+//------------------------------------------------------
 // EXECUTION OF MAIN PROGRAM
+//------------------------------------------------------
+
 int main () {
 	// System configuration
 	system_setup();
@@ -2765,51 +3568,106 @@ int main () {
 	// State machine: list of transitions
 	// {OriginState, CheckFunction, DestinationState, ActionFunction}
 	fsm_trans_t q4s_table[] = {
-		{ WAIT_CONNECT, check_connect, WAIT_START, Setup },
-		{ WAIT_START, check_begin,  HANDSHAKE, Begin },
-		{ HANDSHAKE, check_receive_ok,  HANDSHAKE, Store },
-		{ HANDSHAKE, check_go_to_0,  STAGE_0, Ready0 },
-		{ HANDSHAKE, check_go_to_1,  STAGE_1, Ready1 },
-		{ HANDSHAKE, check_cancel, TERMINATION, Cancel },
-		{ STAGE_0, check_receive_ok, PING_MEASURE_0, Ping_Init },
-		{ PING_MEASURE_0, check_temp_ping_0, PING_MEASURE_0, Ping },
-		{ PING_MEASURE_0, check_receive_ok, PING_MEASURE_0, Update },
-		{ PING_MEASURE_0, check_receive_ping, PING_MEASURE_0, Update },
-		{ PING_MEASURE_0, check_finish_ping, WAIT_NEXT, Decide },
-		{ WAIT_NEXT, check_go_to_1, STAGE_1, Ready1 },
-		{ STAGE_1, check_receive_ok, BWIDTH_MEASURE, Bwidth_Init },
-		{ BWIDTH_MEASURE, check_temp_bwidth, BWIDTH_MEASURE, Bwidth },
-		{ BWIDTH_MEASURE, check_receive_bwidth, BWIDTH_MEASURE, Update },
-		{ BWIDTH_MEASURE, check_finish_bwidth, WAIT_NEXT, Decide },
-		{ WAIT_NEXT, check_cancel, TERMINATION, Cancel},
-		{ TERMINATION, check_receive_cancel, WAIT_CONNECT,  Exit },
-		{ -1, NULL, -1, NULL }
+		  { WAIT_CONNECT, check_connect, WAIT_START, Setup },
+			{ WAIT_START, check_begin,  HANDSHAKE, Begin },
+			{ HANDSHAKE, check_receive_ok,  HANDSHAKE, Store },
+			{ HANDSHAKE, check_go_to_0,  STAGE_0, Ready0 },
+			{ HANDSHAKE, check_go_to_1,  STAGE_1, Ready1 },
+			{ HANDSHAKE, check_cancel, TERMINATION, Cancel },
+			{ HANDSHAKE, check_receive_cancel, END, Exit },
+			{ STAGE_0, check_receive_ok, PING_MEASURE_0, Ping_Init },
+			{ STAGE_0, check_cancel, TERMINATION, Cancel },
+			{ STAGE_0, check_receive_cancel, END, Exit },
+			{ PING_MEASURE_0, check_temp_ping_0, PING_MEASURE_0, Ping },
+			{ PING_MEASURE_0, check_receive_ok, PING_MEASURE_0, Update },
+			{ PING_MEASURE_0, check_receive_ping, PING_MEASURE_0, Update },
+			{ PING_MEASURE_0, check_cancel, TERMINATION, Cancel},
+			{ PING_MEASURE_0, check_finish_ping, WAIT_NEXT, Decide },
+			{ PING_MEASURE_0, check_receive_cancel, END, Exit },
+			{ WAIT_NEXT, check_go_to_1, STAGE_1, Ready1 },
+			{ STAGE_1, check_receive_ok, BWIDTH_MEASURE, Bwidth_Init },
+			{ STAGE_1, check_cancel, TERMINATION, Cancel },
+			{ STAGE_1, check_receive_cancel, END, Exit },
+			{ BWIDTH_MEASURE, check_bwidth_burst_sent, BWIDTH_MEASURE, Bwidth_Decide },
+			{ BWIDTH_MEASURE, check_receive_bwidth, BWIDTH_MEASURE, Update },
+			{ BWIDTH_MEASURE, check_measure_bwidth, BWIDTH_MEASURE, Update },
+			{ BWIDTH_MEASURE, check_cancel, TERMINATION, Cancel},
+			{ BWIDTH_MEASURE, check_receive_cancel, END, Exit },
+			{ BWIDTH_MEASURE, check_finish_bwidth, WAIT_NEXT, Decide },
+			{ WAIT_NEXT, check_go_to_2, STAGE_2, Ready2 },
+			{ WAIT_NEXT, check_receive_cancel, END, Exit },
+			{ STAGE_2, check_receive_ok, PING_MEASURE_2,  Ping_Init },
+			{ STAGE_2, check_cancel, TERMINATION, Cancel },
+			{ STAGE_2, check_receive_cancel, END, Exit },
+			{ PING_MEASURE_2, check_temp_ping_2, PING_MEASURE_2, Ping },
+			{ PING_MEASURE_2, check_receive_ok, PING_MEASURE_2, Update },
+			{ PING_MEASURE_2, check_receive_ping, PING_MEASURE_2, Update },
+			{ PING_MEASURE_2, check_cancel, TERMINATION, Cancel},
+			{ PING_MEASURE_2, check_receive_cancel, END, Exit },
+			{ TERMINATION, check_cancel, TERMINATION, Cancel },
+			{ TERMINATION, check_receive_cancel, END,  Exit },
+			{ -1, NULL, -1, NULL }
 	};
 
   // State machine creation
-	fsm_t* q4s_fsm = fsm_new (WAIT_CONNECT, q4s_table, NULL);
+	q4s_fsm = fsm_new (WAIT_CONNECT, q4s_table, NULL);
 
 	// State machine initialitation
 	fsm_setup (q4s_fsm);
 
 	pthread_mutex_lock(&mutex_print);
-	printf("Press 'q' to connect to the Q4S server\n");
+	printf("Press 'b' to begin a Q4S session\n");
 	pthread_mutex_unlock(&mutex_print);
 
 	while (1) {
 		// State machine operation
 		fsm_fire (q4s_fsm);
-		// Waits for CLK_MS milliseconds
-		delay (CLK_MS);
+		// Waits for CLK_FSM milliseconds
+		delay (CLK_FSM);
+		if (finished) {
+			break;
+		}
 	}
+
+	finished = false;
+
+	// Cancels timers
+	cancel_timer_ping_0 = true;
+	cancel_timer_ping_2 = true;
+	cancel_timer_delivery_bwidth = true;
+	cancel_timer_reception_bwidth = true;
+	// Cancels the threads receiving Q4S messages
+	cancel_UDP_thread = true;
+	pthread_mutex_lock(&mutex_session);
+	pthread_mutex_lock(&mutex_print);
+	pthread_mutex_lock(&mutex_buffer_UDP);
+	pthread_cancel(receive_UDP_thread);
+	pthread_mutex_unlock(&mutex_buffer_UDP);
+	pthread_mutex_unlock(&mutex_print);
+	pthread_mutex_unlock(&mutex_session);
+
+  cancel_TCP_thread = true;
+	pthread_mutex_lock(&mutex_session);
+	pthread_mutex_lock(&mutex_print);
+	pthread_mutex_lock(&mutex_buffer_TCP);
+	pthread_cancel(receive_TCP_thread);
+	pthread_mutex_unlock(&mutex_buffer_TCP);
+	pthread_mutex_unlock(&mutex_print);
+	pthread_mutex_unlock(&mutex_session);
+
+	//delay(1000);
+
+	// Closes connection with Q4S server
+	close(socket_UDP);
+  close(socket_TCP);
+
+	//delay(1000);
+
 
 	// State machine destruction
 	fsm_destroy (q4s_fsm);
-	// Threads destruction
-	pthread_cancel(receive_TCP_thread);
-	pthread_cancel(receive_UDP_thread);
-	pthread_cancel(keyboard_thread);
-	pthread_cancel(timer_ping);
-	pthread_cancel(timer_bwidth);
+
+	// Cancels the keyboard thread
+	cancel_keyboard_thread = true;
 	return 0;
 }
